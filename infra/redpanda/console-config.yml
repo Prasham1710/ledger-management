@@ -1,0 +1,17 @@
+# Redpanda Console — browser UI at http://localhost:8085
+
+kafka:
+  brokers:
+    - redpanda:9092
+
+schemaRegistry:
+  enabled: true
+  urls:
+    # Apicurio exposes a Confluent Schema Registry-compatible API at this path.
+    - http://apicurio:8080/apis/ccompat/v6
+
+connect:
+  enabled: true
+  clusters:
+    - name: ledger-debezium
+      url: http://debezium:8083

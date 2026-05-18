@@ -1,0 +1,44 @@
+version: "2"
+
+linters:
+  enable:
+    - errcheck
+    - gosimple
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - gofmt
+    - goimports
+    - misspell
+    - revive
+    - gosec
+    - bodyclose
+    - contextcheck
+    - noctx
+    - exhaustruct
+    - wrapcheck
+
+linters-settings:
+  goimports:
+    local-prefixes: github.com/prasham/ledger
+  revive:
+    rules:
+      - name: exported
+        arguments:
+          - checkPrivateReceivers
+          - sayRepetitiveInsteadOfStutters
+  gosec:
+    excludes:
+      - G404  # weak random — we use crypto/rand for IDs, not math/rand
+  wrapcheck:
+    ignorePackageGlobs:
+      - github.com/prasham/ledger/*
+
+issues:
+  exclude-rules:
+    - path: _test\.go
+      linters:
+        - exhaustruct
+        - wrapcheck
+        - gosec

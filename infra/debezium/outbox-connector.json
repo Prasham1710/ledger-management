@@ -1,0 +1,39 @@
+{
+  "name": "ledger-outbox-connector",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+
+    "database.hostname": "postgres",
+    "database.port":     "5432",
+    "database.user":     "__POSTGRES_USER__",
+    "database.password": "__POSTGRES_PASSWORD__",
+    "database.dbname":   "__POSTGRES_DB__",
+    "topic.prefix":      "dbz",
+
+    "plugin.name":              "pgoutput",
+    "slot.name":                "ledger_outbox_slot",
+    "publication.name":         "ledger_outbox_pub",
+    "publication.autocreate.mode": "all_tables",
+
+    "table.include.list": "transaction.outbox_messages,ledger.outbox_messages,account.outbox_messages,payout.outbox_messages",
+
+    "heartbeat.interval.ms": "5000",
+    "snapshot.mode":         "never",
+
+    "transforms": "outbox",
+    "transforms.outbox.type": "io.debezium.transforms.outbox.EventRouter",
+
+    "transforms.outbox.table.field.event.id":      "id",
+    "transforms.outbox.table.field.event.key":      "aggregate_id",
+    "transforms.outbox.table.field.event.type":     "event_type",
+    "transforms.outbox.table.field.event.payload":  "payload",
+    "transforms.outbox.table.field.event.timestamp": "created_at",
+
+    "transforms.outbox.route.by.field":          "event_type",
+    "transforms.outbox.route.topic.replacement": "payments.${routedByValue}",
+
+    "key.converter":   "org.apache.kafka.connect.storage.StringConverter",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter.schemas.enable": "false"
+  }
+}

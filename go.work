@@ -1,0 +1,13 @@
+go 1.22
+
+use (
+	./internal
+	./services/ledger-svc
+	./services/account-svc
+	./services/fx-svc
+	./services/transaction-svc
+	./services/payout-svc
+	./services/recon-worker
+	./services/gateway
+	./services/consumers
+)

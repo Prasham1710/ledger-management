@@ -13,6 +13,10 @@ volumes:
   minio-data:
   pgadmin-data:
   redisinsight-data:
+  prometheus-data:
+  grafana-data:
+  tempo-data:
+  loki-data:
 
 # ─── Services ──────────────────────────────────────────────────────────────
 services:
@@ -284,6 +288,142 @@ services:
         condition: service_healthy
     volumes:
       - redisinsight-data:/data
+
+  # ── OpenTelemetry Collector ───────────────────────────────────────────────
+  # Receives OTLP traces/metrics from all Go services.
+  # Forwards traces → Tempo, metrics → Prometheus (via /metrics on 8889).
+  # Go services point OTEL_EXPORTER_OTLP_ENDPOINT at localhost:4317.
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.104.0
+    container_name: ledger-otel-collector
+    restart: unless-stopped
+    networks: [ledger-net]
+    ports:
+      - "4317:4317"   # OTLP gRPC — Go services → collector
+      - "4318:4318"   # OTLP HTTP
+      - "8889:8889"   # Prometheus scrape target (collector re-exports service metrics)
+    volumes:
+      - ./infra/otel-collector/config.yaml:/etc/otel-collector/config.yaml:ro
+    command: ["--config=/etc/otel-collector/config.yaml"]
+    depends_on:
+      tempo:
+        condition: service_healthy
+
+  # ── Prometheus ────────────────────────────────────────────────────────────
+  # Scrapes otel-collector:8889 for Go service metrics.
+  # Phase 5+ services expose /metrics and are added to prometheus.yml.
+  # http://localhost:9090
+  prometheus:
+    image: prom/prometheus:v2.53.2
+    container_name: ledger-prometheus
+    restart: unless-stopped
+    networks: [ledger-net]
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.enable-lifecycle
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://localhost:9090/-/healthy"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # ── Grafana Tempo ─────────────────────────────────────────────────────────
+  # Distributed trace storage. Receives OTLP from otel-collector.
+  # Grafana queries traces via HTTP on 3200.
+  tempo:
+    image: grafana/tempo:2.5.0
+    container_name: ledger-tempo
+    restart: unless-stopped
+    networks: [ledger-net]
+    ports:
+      - "3200:3200"   # HTTP API (Grafana datasource)
+    volumes:
+      - ./infra/tempo/tempo.yaml:/etc/tempo/tempo.yaml:ro
+      - tempo-data:/var/tempo
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://localhost:3200/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  # ── Grafana Loki ──────────────────────────────────────────────────────────
+  # Log aggregation. Receives structured JSON logs from Promtail.
+  # Grafana queries logs via HTTP on 3100.
+  loki:
+    image: grafana/loki:3.1.1
+    container_name: ledger-loki
+    restart: unless-stopped
+    networks: [ledger-net]
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./infra/loki/loki.yaml:/etc/loki/loki.yaml:ro
+      - loki-data:/loki
+    command: ["-config.file=/etc/loki/loki.yaml"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://localhost:3100/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  # ── Promtail ──────────────────────────────────────────────────────────────
+  # Tails Docker container logs and ships them to Loki.
+  # Reads zerolog JSON fields (level, message) as Loki labels.
+  promtail:
+    image: grafana/promtail:3.1.1
+    container_name: ledger-promtail
+    restart: unless-stopped
+    networks: [ledger-net]
+    volumes:
+      - ./infra/promtail/promtail.yaml:/etc/promtail/promtail.yaml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    command: ["-config.file=/etc/promtail/promtail.yaml"]
+    depends_on:
+      loki:
+        condition: service_healthy
+
+  # ── Grafana ───────────────────────────────────────────────────────────────
+  # Dashboards wired to Prometheus (metrics), Loki (logs), Tempo (traces).
+  # Auto-provisioned datasources from infra/grafana/provisioning/.
+  # http://localhost:3000
+  grafana:
+    image: grafana/grafana:11.1.4
+    container_name: ledger-grafana
+    restart: unless-stopped
+    networks: [ledger-net]
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER:     ${GRAFANA_ADMIN_USER}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD}
+      GF_USERS_ALLOW_SIGN_UP:     "false"
+    volumes:
+      - ./infra/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./infra/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      prometheus:
+        condition: service_healthy
+      loki:
+        condition: service_healthy
+      tempo:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://localhost:3000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
 
   # ── Toxiproxy ─────────────────────────────────────────────────────────────
   # Injects latency, dropped packets, and connection resets for chaos tests.

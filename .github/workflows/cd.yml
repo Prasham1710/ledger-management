@@ -1,0 +1,110 @@
+name: CD
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: cd-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ghcr.io/${{ github.repository_owner }}/ledger
+
+jobs:
+  # ── Build & push Docker images ────────────────────────────────────────────
+  docker:
+    name: Build & push ${{ matrix.service }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        service:
+          - ledger-svc
+          - account-svc
+          - fx-svc
+          - transaction-svc
+          - payout-svc
+          - recon-worker
+          - gateway
+          - consumers
+          - ui-bff
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker meta
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_PREFIX }}/${{ matrix.service }}
+          tags: |
+            type=sha,prefix=,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: services/${{ matrix.service }}/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
+
+  # ── Helm deploy (optional — requires KUBECONFIG secret) ──────────────────
+  deploy:
+    name: Helm deploy
+    runs-on: ubuntu-latest
+    needs: docker
+    if: vars.DEPLOY_ENABLED == 'true'   # set this repo variable to enable
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: "3.16.2"
+
+      - name: Write kubeconfig
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG }}" > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      - name: Helm upgrade
+        run: |
+          IMAGE_TAG=$(echo "${{ github.sha }}" | cut -c1-7)
+          helm upgrade --install ledger helm/ledger/ \
+            --namespace ledger \
+            --create-namespace \
+            --set global.imageTag="${IMAGE_TAG}" \
+            --set global.postgres.url="${{ secrets.POSTGRES_URL }}" \
+            --set global.redis.url="${{ secrets.REDIS_URL }}" \
+            --set global.minio.accessKey="${{ secrets.MINIO_ACCESS_KEY }}" \
+            --set global.minio.secretKey="${{ secrets.MINIO_SECRET_KEY }}" \
+            --set services.gateway.env.JWT_SECRET="${{ secrets.JWT_SECRET }}" \
+            --set services.gateway.env.ADMIN_PASSWORD="${{ secrets.ADMIN_PASSWORD }}" \
+            --atomic \
+            --timeout 5m \
+            --wait
+
+      - name: Verify rollout
+        run: |
+          kubectl rollout status deployment/gateway         -n ledger --timeout=2m
+          kubectl rollout status deployment/ledger-svc      -n ledger --timeout=2m
+          kubectl rollout status deployment/account-svc     -n ledger --timeout=2m
+          kubectl rollout status deployment/transaction-svc -n ledger --timeout=2m

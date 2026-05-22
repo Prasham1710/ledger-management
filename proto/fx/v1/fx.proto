@@ -1,0 +1,49 @@
+syntax = "proto3";
+
+package fx.v1;
+
+import "common/v1/money.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/prasham/ledger/gen/fx/v1;fxv1";
+
+// Quote is a locked FX rate valid for a short window (e.g. 30s).
+// Lock it before debiting the source account to prevent slippage.
+message Quote {
+  string                    id            = 1;
+  string                    from_currency = 2;
+  string                    to_currency   = 3;
+  string                    rate          = 4; // decimal string
+  common.v1.Money           source_amount = 5;
+  common.v1.Money           target_amount = 6;
+  bool                      locked        = 7;
+  google.protobuf.Timestamp expires_at    = 8;
+  google.protobuf.Timestamp created_at    = 9;
+}
+
+message GetQuoteRequest {
+  string          from_currency = 1;
+  string          to_currency   = 2;
+  common.v1.Money source_amount = 3;
+}
+
+message GetQuoteResponse {
+  Quote quote = 1;
+}
+
+// LockQuote atomically reserves the rate for one transaction.
+// Returns locked=false if the quote has already expired or been used.
+message LockQuoteRequest {
+  string idempotency_key = 1;
+  string quote_id        = 2;
+}
+
+message LockQuoteResponse {
+  Quote quote  = 1;
+  bool  locked = 2;
+}
+
+service FXService {
+  rpc GetQuote  (GetQuoteRequest)  returns (GetQuoteResponse);
+  rpc LockQuote (LockQuoteRequest) returns (LockQuoteResponse);
+}

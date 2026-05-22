@@ -1,0 +1,168 @@
+global:
+  imageRegistry: ghcr.io/prasham/ledger
+  imageTag: latest
+  imagePullPolicy: IfNotPresent
+
+  # Shared infrastructure — override per environment
+  postgres:
+    url: "postgres://ledger:ledger@postgres:5432/ledger?sslmode=disable"
+  redis:
+    url: "redis://redis:6379"
+  minio:
+    endpoint: "minio:9000"
+    accessKey: "minioadmin"
+    secretKey: "minioadmin"
+    useSSL: "false"
+  kafka:
+    brokers: "redpanda:9092"
+
+# Per-service configuration. Each entry produces a Deployment + Service.
+services:
+  ledger-svc:
+    enabled: true
+    replicaCount: 2
+    port: 50051          # primary (gRPC)
+    metricsPort: 9101
+    env:
+      DATABASE_URL:   "$(POSTGRES_URL)"
+      METRICS_PORT:   "9101"
+    resources:
+      requests: { cpu: 100m, memory: 128Mi }
+      limits:   { cpu: 500m, memory: 256Mi }
+
+  account-svc:
+    enabled: true
+    replicaCount: 2
+    port: 50052
+    metricsPort: 9102
+    env:
+      DATABASE_URL:       "$(POSTGRES_URL)"
+      REDIS_URL:          "$(REDIS_URL)"
+      LEDGER_GRPC_ADDR:   "ledger-svc:50051"
+      METRICS_PORT:       "9102"
+    resources:
+      requests: { cpu: 100m, memory: 128Mi }
+      limits:   { cpu: 500m, memory: 256Mi }
+
+  fx-svc:
+    enabled: true
+    replicaCount: 2
+    port: 50053
+    metricsPort: 9103
+    env:
+      DATABASE_URL:  "$(POSTGRES_URL)"
+      REDIS_URL:     "$(REDIS_URL)"
+      METRICS_PORT:  "9103"
+    resources:
+      requests: { cpu: 100m, memory: 128Mi }
+      limits:   { cpu: 500m, memory: 256Mi }
+
+  transaction-svc:
+    enabled: true
+    replicaCount: 2
+    port: 50054
+    metricsPort: 9104
+    env:
+      DATABASE_URL:       "$(POSTGRES_URL)"
+      REDIS_URL:          "$(REDIS_URL)"
+      LEDGER_GRPC_ADDR:   "ledger-svc:50051"
+      ACCOUNT_GRPC_ADDR:  "account-svc:50052"
+      METRICS_PORT:       "9104"
+    resources:
+      requests: { cpu: 200m, memory: 256Mi }
+      limits:   { cpu: 1000m, memory: 512Mi }
+
+  payout-svc:
+    enabled: true
+    replicaCount: 2
+    port: 50055
+    metricsPort: 9105
+    env:
+      DATABASE_URL:       "$(POSTGRES_URL)"
+      REDIS_URL:          "$(REDIS_URL)"
+      LEDGER_GRPC_ADDR:   "ledger-svc:50051"
+      ACCOUNT_GRPC_ADDR:  "account-svc:50052"
+      MINIO_ENDPOINT:     "$(MINIO_ENDPOINT)"
+      MINIO_ACCESS_KEY:   "$(MINIO_ACCESS_KEY)"
+      MINIO_SECRET_KEY:   "$(MINIO_SECRET_KEY)"
+      MINIO_USE_SSL:      "$(MINIO_USE_SSL)"
+      METRICS_PORT:       "9105"
+    resources:
+      requests: { cpu: 100m, memory: 128Mi }
+      limits:   { cpu: 500m, memory: 256Mi }
+
+  recon-worker:
+    enabled: true
+    replicaCount: 1       # single instance — recon is not horizontally scalable without locking
+    port: 9106            # metrics only — no gRPC
+    metricsPort: 9106
+    env:
+      DATABASE_URL:            "$(POSTGRES_URL)"
+      MINIO_ENDPOINT:          "$(MINIO_ENDPOINT)"
+      MINIO_ACCESS_KEY:        "$(MINIO_ACCESS_KEY)"
+      MINIO_SECRET_KEY:        "$(MINIO_SECRET_KEY)"
+      RECON_METRICS_PORT:      "9106"
+      RECON_INTERVAL_SECONDS:  "60"
+    resources:
+      requests: { cpu: 50m,  memory: 64Mi }
+      limits:   { cpu: 200m, memory: 128Mi }
+
+  consumers:
+    enabled: true
+    replicaCount: 2
+    port: 9108
+    metricsPort: 9108
+    env:
+      DATABASE_URL:            "$(POSTGRES_URL)"
+      KAFKA_BROKERS:           "$(KAFKA_BROKERS)"
+      CONSUMERS_METRICS_PORT:  "9108"
+    resources:
+      requests: { cpu: 100m, memory: 128Mi }
+      limits:   { cpu: 500m, memory: 256Mi }
+
+  ui-bff:
+    enabled: true
+    replicaCount: 2
+    port: 8090
+    metricsPort: 8090     # ui-bff serves everything on one port
+    env:
+      LEDGER_GRPC_ADDR:      "ledger-svc:50051"
+      ACCOUNT_GRPC_ADDR:     "account-svc:50052"
+      FX_GRPC_ADDR:          "fx-svc:50053"
+      TRANSACTION_GRPC_ADDR: "transaction-svc:50054"
+      PAYOUT_GRPC_ADDR:      "payout-svc:50055"
+      STATIC_DIR:            "/ui/dist"
+    resources:
+      requests: { cpu: 100m, memory: 128Mi }
+      limits:   { cpu: 500m, memory: 256Mi }
+
+  gateway:
+    enabled: true
+    replicaCount: 2
+    port: 8080
+    metricsPort: 9107
+    env:
+      UPSTREAM_URL:           "http://ui-bff:8090"
+      STATIC_DIR:             "/ui/dist"
+      JWT_SECRET:             "change-me-in-production"   # override via --set or secret
+      ADMIN_USERNAME:         "admin"
+      ADMIN_PASSWORD:         "admin"
+      RATE_LIMIT_RPM:         "300"
+      GATEWAY_PORT:           "8080"
+      GATEWAY_METRICS_PORT:   "9107"
+    resources:
+      requests: { cpu: 100m, memory: 128Mi }
+      limits:   { cpu: 500m, memory: 256Mi }
+
+# Ingress for the gateway (public entry point)
+ingress:
+  enabled: false
+  className: nginx
+  host: ledger.example.com
+  tls: false
+
+# ServiceMonitor for Prometheus Operator (if installed)
+serviceMonitor:
+  enabled: false
+  namespace: monitoring
+  interval: 30s

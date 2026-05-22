@@ -1,13 +1,15 @@
-go 1.22
+go 1.26.1
 
 use (
+	./gen
 	./internal
-	./services/ledger-svc
 	./services/account-svc
+	./services/consumers
 	./services/fx-svc
-	./services/transaction-svc
+	./services/gateway
+	./services/ledger-svc
 	./services/payout-svc
 	./services/recon-worker
-	./services/gateway
-	./services/consumers
+	./services/transaction-svc
+	./services/ui-bff
 )

@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "feature/**"]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── Lint ──────────────────────────────────────────────────────────────────
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache-dependency-path: "**/go.sum"
+
+      - name: go vet (all modules)
+        run: |
+          for mod in internal gen services/ledger-svc services/account-svc \
+              services/fx-svc services/transaction-svc services/payout-svc \
+              services/recon-worker services/gateway services/consumers \
+              services/ui-bff; do
+            echo "=== vet $mod ==="
+            (cd "$mod" && go vet ./...)
+          done
+
+      - name: Check go.sum up-to-date
+        run: |
+          go work sync
+          git diff --exit-code go.work.sum || (echo "go.work.sum is stale — run 'go work sync'" && exit 1)
+
+  # ── Unit Tests ────────────────────────────────────────────────────────────
+  test:
+    name: Test (race detector)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache-dependency-path: "**/go.sum"
+
+      - name: Run all unit tests
+        run: ./scripts/test-all.sh
+
+  # ── Build binaries (verify compile) ──────────────────────────────────────
+  build:
+    name: Build binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+          cache-dependency-path: "**/go.sum"
+
+      - name: Build all services
+        run: |
+          mkdir -p bin
+          go build -ldflags="-s -w" -trimpath -o bin/ledger-svc      ./services/ledger-svc/cmd/ledger-svc/
+          go build -ldflags="-s -w" -trimpath -o bin/account-svc     ./services/account-svc/cmd/account-svc/
+          go build -ldflags="-s -w" -trimpath -o bin/fx-svc          ./services/fx-svc/cmd/fx-svc/
+          go build -ldflags="-s -w" -trimpath -o bin/transaction-svc ./services/transaction-svc/cmd/transaction-svc/
+          go build -ldflags="-s -w" -trimpath -o bin/payout-svc      ./services/payout-svc/cmd/payout-svc/
+          go build -ldflags="-s -w" -trimpath -o bin/recon-worker     ./services/recon-worker/cmd/recon-worker/
+          go build -ldflags="-s -w" -trimpath -o bin/gateway         ./services/gateway/cmd/gateway/
+          go build -ldflags="-s -w" -trimpath -o bin/consumers       ./services/consumers/cmd/consumers/
+          go build -ldflags="-s -w" -trimpath -o bin/ui-bff          ./services/ui-bff/cmd/ui-bff/
+          echo "All binaries built:"
+          ls -lh bin/
+
+  # ── Helm lint ─────────────────────────────────────────────────────────────
+  helm-lint:
+    name: Helm lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: "3.16.2"
+
+      - name: Lint chart
+        run: helm lint helm/ledger/
+
+      - name: Dry-run template render
+        run: |
+          helm template ledger helm/ledger/ \
+            --set global.imageTag=ci-test \
+            --debug \
+            > /dev/null

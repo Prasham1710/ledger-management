@@ -1,0 +1,121 @@
+syntax = "proto3";
+
+package account.v1;
+
+import "common/v1/money.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/prasham/ledger/gen/account/v1;accountv1";
+
+enum AccountStatus {
+  ACCOUNT_STATUS_UNSPECIFIED = 0;
+  ACCOUNT_STATUS_ACTIVE      = 1;
+  ACCOUNT_STATUS_SUSPENDED   = 2;
+  ACCOUNT_STATUS_CLOSED      = 3;
+}
+
+message Account {
+  string                    id           = 1;
+  string                    owner_id     = 2;
+  string                    currency     = 3; // ISO 4217
+  AccountStatus             status       = 4;
+  common.v1.Money           balance      = 5; // available (excludes holds)
+  common.v1.Money           hold_balance = 6; // sum of active holds
+  google.protobuf.Timestamp created_at   = 7;
+  google.protobuf.Timestamp updated_at   = 8;
+}
+
+// Hold reserves funds on an account for a future debit (e.g. T+2 settlement).
+message Hold {
+  string                    id           = 1;
+  string                    account_id   = 2;
+  common.v1.Money           amount       = 3;
+  string                    reference_id = 4;
+  google.protobuf.Timestamp expires_at   = 5;
+  google.protobuf.Timestamp created_at   = 6;
+}
+
+message CreateAccountRequest {
+  string idempotency_key = 1;
+  string owner_id        = 2;
+  string currency        = 3;
+}
+
+message CreateAccountResponse {
+  Account account = 1;
+}
+
+message GetAccountRequest {
+  string account_id = 1;
+}
+
+message GetAccountResponse {
+  Account account = 1;
+}
+
+message ListAccountsRequest {
+  string owner_id   = 1;
+  int32  page_size  = 2;
+  string page_token = 3;
+}
+
+message ListAccountsResponse {
+  repeated Account accounts        = 1;
+  string           next_page_token = 2;
+}
+
+message PlaceHoldRequest {
+  string          idempotency_key = 1;
+  string          account_id      = 2;
+  common.v1.Money amount          = 3;
+  string          reference_id    = 4;
+  int64           ttl_seconds     = 5;
+}
+
+message PlaceHoldResponse {
+  Hold hold = 1;
+}
+
+message ReleaseHoldRequest {
+  string hold_id    = 1;
+  string account_id = 2;
+}
+
+message ReleaseHoldResponse {}
+
+// CreditAccountRequest adds funds to an account (e.g. incoming payment).
+// Called by transaction-svc after ledger PostEntry succeeds.
+message CreditAccountRequest {
+  string          idempotency_key = 1;
+  string          account_id      = 2;
+  common.v1.Money amount          = 3;
+  string          reference_id    = 4;
+}
+
+message CreditAccountResponse {
+  Account account = 1;
+}
+
+// DebitAccountRequest subtracts funds, consuming an existing hold.
+// Called by transaction-svc during saga commit.
+message DebitAccountRequest {
+  string          idempotency_key = 1;
+  string          account_id      = 2;
+  common.v1.Money amount          = 3;
+  string          hold_id         = 4; // hold to consume; empty = direct debit
+  string          reference_id    = 5;
+}
+
+message DebitAccountResponse {
+  Account account = 1;
+}
+
+service AccountService {
+  rpc CreateAccount (CreateAccountRequest) returns (CreateAccountResponse);
+  rpc GetAccount    (GetAccountRequest)    returns (GetAccountResponse);
+  rpc ListAccounts  (ListAccountsRequest)  returns (ListAccountsResponse);
+  rpc PlaceHold      (PlaceHoldRequest)      returns (PlaceHoldResponse);
+  rpc ReleaseHold    (ReleaseHoldRequest)    returns (ReleaseHoldResponse);
+  rpc CreditAccount  (CreditAccountRequest)  returns (CreditAccountResponse);
+  rpc DebitAccount   (DebitAccountRequest)   returns (DebitAccountResponse);
+}

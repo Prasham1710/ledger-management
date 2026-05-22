@@ -1,0 +1,69 @@
+syntax = "proto3";
+
+package payout.v1;
+
+import "common/v1/money.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/prasham/ledger/gen/payout/v1;payoutv1";
+
+enum PayoutStatus {
+  PAYOUT_STATUS_UNSPECIFIED = 0;
+  PAYOUT_STATUS_PENDING     = 1;
+  PAYOUT_STATUS_PROCESSING  = 2; // bank file generated, awaiting settlement
+  PAYOUT_STATUS_SETTLED     = 3; // bank confirmed
+  PAYOUT_STATUS_FAILED      = 4;
+}
+
+enum PayoutRail {
+  PAYOUT_RAIL_UNSPECIFIED = 0;
+  PAYOUT_RAIL_NACH        = 1; // India NACH
+  PAYOUT_RAIL_SEPA        = 2; // Europe SEPA
+  PAYOUT_RAIL_SWIFT       = 3;
+}
+
+message BankAccount {
+  string account_number = 1;
+  string ifsc_code      = 2; // NACH
+  string iban           = 3; // SEPA
+  string bic            = 4; // SEPA / SWIFT
+  string account_name   = 5;
+}
+
+message Payout {
+  string                    id           = 1;
+  PayoutStatus              status       = 2;
+  PayoutRail                rail         = 3;
+  string                    account_id   = 4;
+  common.v1.Money           amount       = 5;
+  BankAccount               destination  = 6;
+  string                    batch_id     = 7;
+  google.protobuf.Timestamp scheduled_at = 8;
+  google.protobuf.Timestamp settled_at   = 9;
+  google.protobuf.Timestamp created_at   = 10;
+}
+
+message InitiatePayoutRequest {
+  string          idempotency_key = 1;
+  string          account_id      = 2;
+  common.v1.Money amount          = 3;
+  PayoutRail      rail            = 4;
+  BankAccount     destination     = 5;
+}
+
+message InitiatePayoutResponse {
+  Payout payout = 1;
+}
+
+message GetPayoutRequest {
+  string payout_id = 1;
+}
+
+message GetPayoutResponse {
+  Payout payout = 1;
+}
+
+service PayoutService {
+  rpc InitiatePayout (InitiatePayoutRequest) returns (InitiatePayoutResponse);
+  rpc GetPayout      (GetPayoutRequest)      returns (GetPayoutResponse);
+}

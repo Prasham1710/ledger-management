@@ -24,6 +24,7 @@ help:
 	@echo "  make clean         Remove build artefacts"
 
 MODULES := \
+	./gen \
 	./internal \
 	./services/ledger-svc \
 	./services/account-svc \
@@ -70,9 +71,17 @@ bin/%:
 	@mkdir -p bin
 	go build -o $@ ./services/$*/cmd/...
 
-# Run buf generate (Part 4) and oapi-codegen (Part 10).
-generate:
+# Lint proto files.
+proto-lint:
+	buf lint proto
+
+# Regenerate Go code from proto files.
+# Run this after any .proto change.
+proto-gen:
 	buf generate
+
+# Run buf generate (Part 4) and oapi-codegen (Part 10).
+generate: proto-gen
 	oapi-codegen -config services/gateway/openapi/.oapi-codegen.yaml services/gateway/openapi/api.yaml
 
 clean:

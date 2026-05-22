@@ -1,0 +1,68 @@
+syntax = "proto3";
+
+package ledger.v1;
+
+import "common/v1/money.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/prasham/ledger/gen/ledger/v1;ledgerv1";
+
+enum EntryType {
+  ENTRY_TYPE_UNSPECIFIED = 0;
+  ENTRY_TYPE_DEBIT       = 1;
+  ENTRY_TYPE_CREDIT      = 2;
+}
+
+// Entry is one side of a double-entry pair.
+// Balances are never stored — they are projected by summing entries.
+message Entry {
+  string                    id           = 1;
+  string                    account_id   = 2;
+  EntryType                 type         = 3;
+  common.v1.Money           amount       = 4;
+  string                    reference_id = 5; // transaction_id or payout_id
+  string                    description  = 6;
+  google.protobuf.Timestamp created_at   = 7;
+}
+
+// PostEntryRequest carries a balanced double-entry pair.
+// debit_account_id and credit_account_id must differ.
+message PostEntryRequest {
+  string          idempotency_key   = 1;
+  string          debit_account_id  = 2;
+  string          credit_account_id = 3;
+  common.v1.Money amount            = 4;
+  string          reference_id      = 5;
+  string          description       = 6;
+}
+
+message PostEntryResponse {
+  Entry debit_entry  = 1;
+  Entry credit_entry = 2;
+}
+
+message GetBalanceRequest {
+  string account_id = 1;
+}
+
+message GetBalanceResponse {
+  string          account_id = 1;
+  common.v1.Money balance    = 2;
+}
+
+message ListEntriesRequest {
+  string account_id  = 1;
+  int32  page_size   = 2;
+  string page_token  = 3;
+}
+
+message ListEntriesResponse {
+  repeated Entry entries         = 1;
+  string         next_page_token = 2;
+}
+
+service LedgerService {
+  rpc PostEntry   (PostEntryRequest)   returns (PostEntryResponse);
+  rpc GetBalance  (GetBalanceRequest)  returns (GetBalanceResponse);
+  rpc ListEntries (ListEntriesRequest) returns (ListEntriesResponse);
+}

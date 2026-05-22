@@ -1,0 +1,55 @@
+syntax = "proto3";
+
+package transaction.v1;
+
+import "common/v1/money.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/prasham/ledger/gen/transaction/v1;transactionv1";
+
+enum TransactionStatus {
+  TRANSACTION_STATUS_UNSPECIFIED = 0;
+  TRANSACTION_STATUS_PENDING     = 1; // saga in flight
+  TRANSACTION_STATUS_COMPLETED   = 2; // all saga steps committed
+  TRANSACTION_STATUS_FAILED      = 3; // saga rolled back
+  TRANSACTION_STATUS_REVERSED    = 4; // post-completion reversal
+}
+
+message Transaction {
+  string            id                = 1;
+  TransactionStatus status            = 2;
+  string            source_account_id = 3;
+  string            dest_account_id   = 4;
+  common.v1.Money   amount            = 5;
+  common.v1.Money   fx_amount         = 6; // non-nil for cross-currency
+  string            fx_rate           = 7; // decimal string; empty for same-currency
+  string            idempotency_key   = 8;
+  string            description       = 9;
+  google.protobuf.Timestamp created_at = 10;
+  google.protobuf.Timestamp updated_at = 11;
+}
+
+message InitiatePaymentRequest {
+  string          idempotency_key   = 1;
+  string          source_account_id = 2;
+  string          dest_account_id   = 3;
+  common.v1.Money amount            = 4;
+  string          description       = 5;
+}
+
+message InitiatePaymentResponse {
+  Transaction transaction = 1;
+}
+
+message GetTransactionRequest {
+  string transaction_id = 1;
+}
+
+message GetTransactionResponse {
+  Transaction transaction = 1;
+}
+
+service TransactionService {
+  rpc InitiatePayment (InitiatePaymentRequest) returns (InitiatePaymentResponse);
+  rpc GetTransaction  (GetTransactionRequest)  returns (GetTransactionResponse);
+}

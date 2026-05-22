@@ -1,0 +1,13 @@
+syntax = "proto3";
+
+package common.v1;
+
+option go_package = "github.com/prasham/ledger/gen/common/v1;commonv1";
+
+// Money represents an exact decimal monetary amount.
+// amount is always a fixed-point decimal string (e.g. "100.0000").
+// Never use float for money.
+message Money {
+  string amount   = 1; // decimal string, 4 decimal places
+  string currency = 2; // ISO 4217, e.g. "INR"
+}

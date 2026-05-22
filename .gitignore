@@ -39,3 +39,13 @@ data/postgres/
 
 # Grafana provisioning state
 data/grafana/
+
+# Claude Code — local personal settings (contains machine-specific allowed commands)
+.claude/settings.local.json
+
+# Node — never commit dependencies or build output
+node_modules/
+ui/dist/
+
+# Service log files
+*.log

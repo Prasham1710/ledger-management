@@ -3,8 +3,18 @@ global:
   imageTag: latest
   imagePullPolicy: IfNotPresent
 
-  # Shared infrastructure — override per environment
+  # appEnv gates the services' insecure-default guards. With "production" the
+  # gateway refuses to start on a placeholder credential and ui-bff refuses to run
+  # without gateway authentication. Set it to production for real deployments.
+  appEnv: development
+
+  # Shared infrastructure — override per environment.
   postgres:
+    # Connection URL. Injected into every service as POSTGRES_URL and read by the
+    # shared config resolver.
+    #
+    # sslmode=disable is a local-development value. Production must use
+    # sslmode=require or stronger: this carries account balances.
     url: "postgres://ledger:ledger@postgres:5432/ledger?sslmode=disable"
   redis:
     url: "redis://redis:6379"
@@ -16,19 +26,86 @@ global:
   kafka:
     brokers: "redpanda:9092"
 
+  # ── Authentication ────────────────────────────────────────────────────────
+  #
+  # These are intentionally EMPTY. The chart previously committed
+  #   JWT_SECRET: "change-me-in-production"
+  #   ADMIN_PASSWORD: "admin"
+  # as plain Deployment env vars, so any deployment that did not override them
+  # could be signed into by anyone who had read this repository — and the values
+  # were readable via `kubectl get deploy -o yaml`.
+  #
+  # They are now delivered through the Secret and left blank by default, so an
+  # unset value fails the service's own startup guard instead of silently
+  # granting access. Supply them with --set or an external secret manager.
+  auth:
+    # jwtSecret must be at least 32 characters. The gateway rejects shorter
+    # secrets and rejects known placeholder values outright.
+    jwtSecret: ""
+    adminUsername: "admin"
+    # adminPassword must be at least 12 characters and not a well-known default.
+    adminPassword: ""
+    # upstreamSecret proves to ui-bff that a request passed through the gateway.
+    # Without it ui-bff refuses to start, because its endpoints move money.
+    upstreamSecret: ""
+    # tokenTTL is an individual token's lifetime.
+    tokenTTL: "1h"
+    # maxSessionAge bounds a session across refreshes, so a leaked token cannot be
+    # rolled forward indefinitely.
+    maxSessionAge: "12h"
+
+  # ── Settlement files ──────────────────────────────────────────────────────
+  settlement:
+    # encryptionKey enables SSE-C on settlement files, which contain beneficiary
+    # bank account numbers and IBANs. Must be exactly 32 bytes, and requires
+    # minio.useSSL=true because SSE-C sends the key in request headers.
+    encryptionKey: ""
+
+  # ── Edge configuration ────────────────────────────────────────────────────
+  gateway:
+    # corsAllowedOrigins is an explicit allow-list. Empty means same-origin only,
+    # which is correct when the SPA is served by the gateway itself. The previous
+    # code sent Access-Control-Allow-Origin: * on the money-moving API.
+    corsAllowedOrigins: ""
+    # trustProxyHeaders must stay false unless an ingress overwrites
+    # X-Forwarded-For. When it was trusted unconditionally, any client could forge
+    # the header and get an unlimited rate-limit allowance — including on the login
+    # endpoint.
+    trustProxyHeaders: false
+    trustedProxyCIDRs: ""
+    rateLimitRPM: 300
+
+  # ── Observability ─────────────────────────────────────────────────────────
+  otel:
+    # endpoint enables tracing when set. Previously every service read an OTLP
+    # endpoint from the environment and never used it, so no span was ever
+    # exported despite a deployed collector.
+    endpoint: "otel-collector:4317"
+
+  # grpcReflection exposes the full service surface for grpcurl. Off in
+  # production: it is a discovery aid, not something to publish.
+  grpcReflection: false
+
 # Per-service configuration. Each entry produces a Deployment + Service.
+#
+# Note the env var names. The chart previously injected POSTGRES_URL and
+# DATABASE_URL while the services read POSTGRES_HOST/PORT/USER/PASSWORD/DB and
+# REDIS_ADDR — names it never set. Every service except consumers therefore fell
+# back to localhost and died on its startup ping. Connection settings now go
+# through a shared resolver that accepts POSTGRES_URL and REDIS_URL, so these
+# names reach the code that reads them.
 services:
   ledger-svc:
     enabled: true
     replicaCount: 2
-    port: 50051          # primary (gRPC)
+    port: 50051 # gRPC
     metricsPort: 9101
     env:
-      DATABASE_URL:   "$(POSTGRES_URL)"
-      METRICS_PORT:   "9101"
+      LEDGER_GRPC_PORT: "50051"
+      LEDGER_METRICS_PORT: "9101"
     resources:
       requests: { cpu: 100m, memory: 128Mi }
-      limits:   { cpu: 500m, memory: 256Mi }
+      limits: { cpu: 500m, memory: 256Mi }
 
   account-svc:
     enabled: true
@@ -36,13 +113,15 @@ services:
     port: 50052
     metricsPort: 9102
     env:
-      DATABASE_URL:       "$(POSTGRES_URL)"
-      REDIS_URL:          "$(REDIS_URL)"
-      LEDGER_GRPC_ADDR:   "ledger-svc:50051"
-      METRICS_PORT:       "9102"
+      ACCOUNT_GRPC_PORT: "50052"
+      ACCOUNT_METRICS_PORT: "9102"
+      # The hold sweeper reclaims reservations left behind by crashed sagas.
+      # Without it, an abandoned saga holds a customer's funds forever.
+      HOLD_SWEEP_INTERVAL: "1m"
+      HOLD_SWEEP_BATCH_SIZE: "100"
     resources:
       requests: { cpu: 100m, memory: 128Mi }
-      limits:   { cpu: 500m, memory: 256Mi }
+      limits: { cpu: 500m, memory: 256Mi }
 
   fx-svc:
     enabled: true
@@ -50,12 +129,16 @@ services:
     port: 50053
     metricsPort: 9103
     env:
-      DATABASE_URL:  "$(POSTGRES_URL)"
-      REDIS_URL:     "$(REDIS_URL)"
-      METRICS_PORT:  "9103"
+      FX_GRPC_PORT: "50053"
+      FX_METRICS_PORT: "9103"
+      FX_QUOTE_TTL_SEC: "30"
+      # Seeding must never run in a real deployment: it would insert
+      # development-constant rates. It also no longer overwrites existing rates,
+      # but leaving it off keeps market data under external control.
+      FX_SEED_RATES: "false"
     resources:
       requests: { cpu: 100m, memory: 128Mi }
-      limits:   { cpu: 500m, memory: 256Mi }
+      limits: { cpu: 500m, memory: 256Mi }
 
   transaction-svc:
     enabled: true
@@ -63,14 +146,20 @@ services:
     port: 50054
     metricsPort: 9104
     env:
-      DATABASE_URL:       "$(POSTGRES_URL)"
-      REDIS_URL:          "$(REDIS_URL)"
-      LEDGER_GRPC_ADDR:   "ledger-svc:50051"
-      ACCOUNT_GRPC_ADDR:  "account-svc:50052"
-      METRICS_PORT:       "9104"
+      TRANSACTION_GRPC_PORT: "50054"
+      TRANSACTION_METRICS_PORT: "9104"
+      LEDGER_GRPC_ADDR: "ledger-svc:50051"
+      ACCOUNT_GRPC_ADDR: "account-svc:50052"
+      PAYMENT_HOLD_TTL: "1h"
+      # The recovery worker compensates sagas abandoned mid-flight. StuckAfter
+      # must exceed the longest legitimate saga, or it will roll back work that is
+      # merely slow.
+      SAGA_RECOVERY_INTERVAL: "1m"
+      SAGA_RECOVERY_STUCK_AFTER: "5m"
+      SAGA_RECOVERY_BATCH_SIZE: "50"
     resources:
       requests: { cpu: 200m, memory: 256Mi }
-      limits:   { cpu: 1000m, memory: 512Mi }
+      limits: { cpu: 1000m, memory: 512Mi }
 
   payout-svc:
     enabled: true
@@ -78,34 +167,33 @@ services:
     port: 50055
     metricsPort: 9105
     env:
-      DATABASE_URL:       "$(POSTGRES_URL)"
-      REDIS_URL:          "$(REDIS_URL)"
-      LEDGER_GRPC_ADDR:   "ledger-svc:50051"
-      ACCOUNT_GRPC_ADDR:  "account-svc:50052"
-      MINIO_ENDPOINT:     "$(MINIO_ENDPOINT)"
-      MINIO_ACCESS_KEY:   "$(MINIO_ACCESS_KEY)"
-      MINIO_SECRET_KEY:   "$(MINIO_SECRET_KEY)"
-      MINIO_USE_SSL:      "$(MINIO_USE_SSL)"
-      METRICS_PORT:       "9105"
+      PAYOUT_GRPC_PORT: "50055"
+      PAYOUT_METRICS_PORT: "9105"
+      LEDGER_GRPC_ADDR: "ledger-svc:50051"
+      ACCOUNT_GRPC_ADDR: "account-svc:50052"
+      MINIO_SETTLEMENT_BUCKET: "settlement-files"
+      PAYOUT_RECOVERY_INTERVAL: "1m"
+      PAYOUT_RECOVERY_STUCK_AFTER: "5m"
+      PAYOUT_RECOVERY_BATCH_SIZE: "50"
     resources:
       requests: { cpu: 100m, memory: 128Mi }
-      limits:   { cpu: 500m, memory: 256Mi }
+      limits: { cpu: 500m, memory: 256Mi }
 
   recon-worker:
     enabled: true
-    replicaCount: 1       # single instance — recon is not horizontally scalable without locking
-    port: 9106            # metrics only — no gRPC
+    # Single instance. Reconciliation is a whole-table scan and does not benefit
+    # from parallelism.
+    replicaCount: 1
+    port: 9106 # metrics only — no gRPC
     metricsPort: 9106
     env:
-      DATABASE_URL:            "$(POSTGRES_URL)"
-      MINIO_ENDPOINT:          "$(MINIO_ENDPOINT)"
-      MINIO_ACCESS_KEY:        "$(MINIO_ACCESS_KEY)"
-      MINIO_SECRET_KEY:        "$(MINIO_SECRET_KEY)"
-      RECON_METRICS_PORT:      "9106"
-      RECON_INTERVAL_SECONDS:  "60"
+      RECON_METRICS_PORT: "9106"
+      RECON_INTERVAL_SECONDS: "60"
+      RECON_MAX_FINDINGS: "500"
+      MINIO_RECON_BUCKET: "recon-reports"
     resources:
-      requests: { cpu: 50m,  memory: 64Mi }
-      limits:   { cpu: 200m, memory: 128Mi }
+      requests: { cpu: 50m, memory: 64Mi }
+      limits: { cpu: 200m, memory: 128Mi }
 
   consumers:
     enabled: true
@@ -113,28 +201,42 @@ services:
     port: 9108
     metricsPort: 9108
     env:
-      DATABASE_URL:            "$(POSTGRES_URL)"
-      KAFKA_BROKERS:           "$(KAFKA_BROKERS)"
-      CONSUMERS_METRICS_PORT:  "9108"
+      CONSUMERS_METRICS_PORT: "9108"
+      KAFKA_GROUP_ID: "ledger-consumers"
+      RELAY_INTERVAL: "1s"
+      RELAY_BATCH_SIZE: "100"
+      RELAY_LEASE: "30s"
+      OUTBOX_PUBLISHED_RETENTION: "24h"
+      OUTBOX_PURGE_INTERVAL: "1h"
     resources:
       requests: { cpu: 100m, memory: 128Mi }
-      limits:   { cpu: 500m, memory: 256Mi }
+      limits: { cpu: 500m, memory: 256Mi }
 
   ui-bff:
     enabled: true
     replicaCount: 2
     port: 8090
-    metricsPort: 8090     # ui-bff serves everything on one port
+    # A separate metrics port. This was previously set equal to `port`, so the
+    # probes hit /healthz on the API listener — which fell through to the SPA
+    # catch-all and returned index.html with a 200. Readiness "passed" by serving
+    # HTML while the service could be entirely unable to reach its upstreams.
+    metricsPort: 9109
     env:
-      LEDGER_GRPC_ADDR:      "ledger-svc:50051"
-      ACCOUNT_GRPC_ADDR:     "account-svc:50052"
-      FX_GRPC_ADDR:          "fx-svc:50053"
+      UI_BFF_ADDR: ":8090"
+      UI_BFF_METRICS_PORT: "9109"
+      LEDGER_GRPC_ADDR: "ledger-svc:50051"
+      ACCOUNT_GRPC_ADDR: "account-svc:50052"
+      FX_GRPC_ADDR: "fx-svc:50053"
       TRANSACTION_GRPC_ADDR: "transaction-svc:50054"
-      PAYOUT_GRPC_ADDR:      "payout-svc:50055"
-      STATIC_DIR:            "/ui/dist"
+      PAYOUT_GRPC_ADDR: "payout-svc:50055"
+      STATIC_DIR: "/ui/dist"
+      # ui-bff serves credit, debit, transfer, payout, and raw ledger posting. It
+      # had no authentication at all, on a Service reachable from any pod in the
+      # cluster. This must stay true.
+      REQUIRE_GATEWAY_AUTH: "true"
     resources:
       requests: { cpu: 100m, memory: 128Mi }
-      limits:   { cpu: 500m, memory: 256Mi }
+      limits: { cpu: 500m, memory: 256Mi }
 
   gateway:
     enabled: true
@@ -142,17 +244,13 @@ services:
     port: 8080
     metricsPort: 9107
     env:
-      UPSTREAM_URL:           "http://ui-bff:8090"
-      STATIC_DIR:             "/ui/dist"
-      JWT_SECRET:             "change-me-in-production"   # override via --set or secret
-      ADMIN_USERNAME:         "admin"
-      ADMIN_PASSWORD:         "admin"
-      RATE_LIMIT_RPM:         "300"
-      GATEWAY_PORT:           "8080"
-      GATEWAY_METRICS_PORT:   "9107"
+      GATEWAY_PORT: "8080"
+      GATEWAY_METRICS_PORT: "9107"
+      UPSTREAM_URL: "http://ui-bff:8090"
+      STATIC_DIR: "/ui/dist"
     resources:
       requests: { cpu: 100m, memory: 128Mi }
-      limits:   { cpu: 500m, memory: 256Mi }
+      limits: { cpu: 500m, memory: 256Mi }
 
 # Ingress for the gateway (public entry point)
 ingress:
@@ -166,3 +264,11 @@ serviceMonitor:
   enabled: false
   namespace: monitoring
   interval: 30s
+
+# NetworkPolicy restricting which pods may reach the internal services.
+#
+# Defence in depth behind ui-bff's own authentication: only the gateway should be
+# able to reach ui-bff, and only ui-bff and the sagas should reach the gRPC
+# services. Requires a CNI that enforces NetworkPolicy.
+networkPolicy:
+  enabled: false

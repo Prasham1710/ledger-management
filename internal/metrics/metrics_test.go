@@ -1,6 +1,8 @@
 package metrics_test
 
 import (
+	"context"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -12,11 +14,10 @@ import (
 	"github.com/prasham/ledger/internal/metrics"
 )
 
-
 func TestHandler_ExposesGoRuntime(t *testing.T) {
 	r := metrics.New()
 	w := httptest.NewRecorder()
-	r.Handler().ServeHTTP(w, httptest.NewRequest("GET", "/metrics", nil))
+	r.Handler().ServeHTTP(w, httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/metrics", nil))
 	assert.Equal(t, 200, w.Code)
 	assert.True(t, strings.Contains(w.Body.String(), "go_goroutines"))
 }

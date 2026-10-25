@@ -1,53 +1,41 @@
 package config
 
 import (
-	"os"
 	"time"
+
+	shared "github.com/prasham/ledger/internal/config"
 )
 
+// Config holds recon-worker runtime settings.
 type Config struct {
-	MetricsPort    string
-	DSN            string
-	MinIOEndpoint  string
-	MinIOAccessKey string
-	MinIOSecretKey string
-	MinIOBucket    string
-	Interval       time.Duration
+	MetricsPort string
+	DSN         string
+	MinIO       shared.MinIO
+	Interval    time.Duration
+	// MaxFindings bounds how many discrepancies one report carries, so systemic
+	// drift cannot produce an unbounded query result and report.
+	MaxFindings int
+
+	OTLPEndpoint string
+	Version      string
 }
 
+// Load resolves configuration from the environment.
 func Load() Config {
-	interval := 60 * time.Second
-	if v := os.Getenv("RECON_INTERVAL_SECONDS"); v != "" {
-		if d, err := time.ParseDuration(v + "s"); err == nil {
-			interval = d
-		}
-	}
+	minioCfg := shared.MinIOConfig("recon-reports")
+	// Allow the legacy bucket variable to keep working.
+	minioCfg.Bucket = shared.Env("MINIO_RECON_BUCKET", minioCfg.Bucket)
+
 	return Config{
-		MetricsPort:    env("RECON_METRICS_PORT", "9106"),
-		DSN:            buildDSN(),
-		MinIOEndpoint:  env("MINIO_ENDPOINT", "localhost:9000"),
-		MinIOAccessKey: env("MINIO_ACCESS_KEY", "minioadmin"),
-		MinIOSecretKey: env("MINIO_SECRET_KEY", "minioadmin"),
-		MinIOBucket:    env("MINIO_RECON_BUCKET", "recon-reports"),
-		Interval:       interval,
-	}
-}
+		MetricsPort: shared.Env("RECON_METRICS_PORT", "9106"),
+		DSN:         shared.PostgresDSN(),
+		MinIO:       minioCfg,
+		// RECON_INTERVAL_SECONDS still works: EnvDuration accepts a bare integer
+		// as seconds as well as a Go duration string.
+		Interval:    shared.EnvDuration("RECON_INTERVAL_SECONDS", time.Minute),
+		MaxFindings: shared.EnvInt("RECON_MAX_FINDINGS", 500),
 
-func buildDSN() string {
-	if v := os.Getenv("POSTGRES_DSN"); v != "" {
-		return v
+		OTLPEndpoint: shared.OTLPEndpoint(),
+		Version:      shared.Version(),
 	}
-	return "host=" + env("POSTGRES_HOST", "localhost") +
-		" port=" + env("POSTGRES_PORT", "5432") +
-		" user=" + env("POSTGRES_USER", "ledger") +
-		" password=" + env("POSTGRES_PASSWORD", "ledger") +
-		" dbname=" + env("POSTGRES_DB", "ledger") +
-		" sslmode=disable"
-}
-
-func env(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return def
 }

@@ -1,51 +1,47 @@
 package config
 
 import (
-	"fmt"
-	"os"
-	"strconv"
+	"github.com/redis/go-redis/v9"
+
+	shared "github.com/prasham/ledger/internal/config"
 )
 
+// Config holds ledger-svc runtime settings.
 type Config struct {
 	GRPCPort    int
 	MetricsPort int
 	PostgresDSN string
-	RedisAddr   string
+	// Redis carries full connection settings so a rediss:// URL with
+	// credentials works, not just a bare host:port.
+	Redis *redis.Options
+	// OTLPEndpoint enables tracing when non-empty.
 	OTLPEndpoint string
+	// Version is the deployed build identifier, attached to traces and metrics.
+	Version string
+	// EnableReflection exposes the gRPC service surface for grpcurl. Off by
+	// default: it should not be reachable in production.
+	EnableReflection bool
 }
 
-func Load() Config {
+// Load resolves configuration from the environment. Connection settings go
+// through the shared resolver so the names injected by Helm (POSTGRES_URL,
+// REDIS_URL) and the names used locally (POSTGRES_HOST, REDIS_ADDR) both work.
+//
+// Returns an error rather than falling back to localhost on a malformed
+// connection URL: silently connecting somewhere unintended is worse than
+// refusing to start.
+func Load() (Config, error) {
+	redisOpts, err := shared.RedisOptions()
+	if err != nil {
+		return Config{}, err
+	}
 	return Config{
-		GRPCPort:     envInt("LEDGER_GRPC_PORT", 50051),
-		MetricsPort:  envInt("LEDGER_METRICS_PORT", 9101),
-		PostgresDSN:  buildDSN(),
-		RedisAddr:    getEnv("REDIS_ADDR", "localhost:6379"),
-		OTLPEndpoint: getEnv("OTEL_EXPORTER_OTLP_ENDPOINT", ""),
-	}
-}
-
-func buildDSN() string {
-	host := getEnv("POSTGRES_HOST", "localhost")
-	port := getEnv("POSTGRES_PORT", "5432")
-	user := getEnv("POSTGRES_USER", "ledger")
-	pass := getEnv("POSTGRES_PASSWORD", "ledger")
-	dbname := getEnv("POSTGRES_DB", "ledger")
-	return fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=disable",
-		user, pass, host, port, dbname)
-}
-
-func getEnv(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return def
-}
-
-func envInt(key string, def int) int {
-	if v := os.Getenv(key); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			return n
-		}
-	}
-	return def
+		GRPCPort:         shared.EnvInt("LEDGER_GRPC_PORT", 50051),
+		MetricsPort:      shared.EnvInt("LEDGER_METRICS_PORT", 9101),
+		PostgresDSN:      shared.PostgresDSN(),
+		Redis:            redisOpts,
+		OTLPEndpoint:     shared.OTLPEndpoint(),
+		Version:          shared.Version(),
+		EnableReflection: shared.EnvBool("GRPC_REFLECTION", !shared.IsProduction()),
+	}, nil
 }

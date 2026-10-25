@@ -2,57 +2,79 @@ package service
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"strconv"
 	"time"
 
-	"github.com/shopspring/decimal"
+	"github.com/rs/zerolog"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	accountv1 "github.com/prasham/ledger/gen/account/v1"
 	commonv1 "github.com/prasham/ledger/gen/common/v1"
+	"github.com/prasham/ledger/internal/idemguard"
 	"github.com/prasham/ledger/internal/idempotency"
+	"github.com/prasham/ledger/internal/money"
 	"github.com/prasham/ledger/services/account-svc/internal/db"
+)
+
+const (
+	defaultPageSize = 20
+	maxPageSize     = 100
+
+	// defaultHoldTTL matches T+2 settlement. Callers should set an explicit TTL
+	// that reflects how long their saga can plausibly take.
+	defaultHoldTTL = 48 * time.Hour
+	// maxHoldTTL bounds how long a caller may reserve someone's funds. An
+	// unbounded TTL combined with a crashed saga is indistinguishable from
+	// confiscation.
+	maxHoldTTL = 7 * 24 * time.Hour
 )
 
 type AccountServer struct {
 	accountv1.UnimplementedAccountServiceServer
 	repo *db.Repo
 	idem idempotency.Store
+	log  zerolog.Logger
 }
 
-func NewAccountServer(repo *db.Repo, idem idempotency.Store) *AccountServer {
-	return &AccountServer{repo: repo, idem: idem}
+func NewAccountServer(repo *db.Repo, idem idempotency.Store, log zerolog.Logger) *AccountServer {
+	return &AccountServer{repo: repo, idem: idem, log: log}
 }
 
 // ── CreateAccount ─────────────────────────────────────────────────────────────
 
 func (s *AccountServer) CreateAccount(ctx context.Context, req *accountv1.CreateAccountRequest) (*accountv1.CreateAccountResponse, error) {
-	if req.IdempotencyKey == "" {
+	switch {
+	case req.IdempotencyKey == "":
 		return nil, status.Error(codes.InvalidArgument, "idempotency_key required")
-	}
-	if req.OwnerId == "" {
+	case req.OwnerId == "":
 		return nil, status.Error(codes.InvalidArgument, "owner_id required")
-	}
-	if req.Currency == "" {
+	case req.Currency == "":
 		return nil, status.Error(codes.InvalidArgument, "currency required")
 	}
-
-	idemKey := "account:create:" + req.IdempotencyKey
-	if existing, _ := s.idem.Get(ctx, idemKey); existing != nil {
-		return nil, status.Error(codes.AlreadyExists, "duplicate idempotency_key")
+	if err := money.Currency(req.Currency).Validate(); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "currency: %v", err)
 	}
 
-	acc, err := s.repo.CreateAccount(ctx, req.OwnerId, req.Currency)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "create account: %v", err)
-	}
-
-	_ = s.idem.Set(ctx, idemKey, idempotency.Entry{StatusCode: 0, CreatedAt: time.Now()})
-
-	return &accountv1.CreateAccountResponse{Account: toProtoAccount(acc)}, nil
+	return idemguard.Do(ctx, s.idem, s.log, "account:create:"+req.IdempotencyKey,
+		func() *accountv1.CreateAccountResponse { return &accountv1.CreateAccountResponse{} },
+		func(ctx context.Context) (*accountv1.CreateAccountResponse, error) {
+			acc, err := s.repo.CreateAccount(ctx, req.OwnerId, req.Currency)
+			if err != nil {
+				// An owner may hold only one active account per currency. That is
+				// a caller-visible conflict, not an internal fault — it was
+				// previously surfaced as a raw Postgres error under codes.Internal.
+				if errors.Is(err, db.ErrAccountExists) {
+					return nil, status.Errorf(codes.AlreadyExists,
+						"owner %s already has an active %s account", req.OwnerId, req.Currency)
+				}
+				s.log.Error().Err(err).Str("owner_id", req.OwnerId).Msg("create account failed")
+				return nil, status.Error(codes.Internal, "create account failed")
+			}
+			return &accountv1.CreateAccountResponse{Account: toProtoAccount(acc)}, nil
+		})
 }
 
 // ── GetAccount ────────────────────────────────────────────────────────────────
@@ -64,12 +86,12 @@ func (s *AccountServer) GetAccount(ctx context.Context, req *accountv1.GetAccoun
 
 	acc, err := s.repo.GetAccount(ctx, req.AccountId)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "get account: %v", err)
+		s.log.Error().Err(err).Str("account_id", req.AccountId).Msg("get account failed")
+		return nil, status.Error(codes.Internal, "get account failed")
 	}
 	if acc == nil {
 		return nil, status.Error(codes.NotFound, "account not found")
 	}
-
 	return &accountv1.GetAccountResponse{Account: toProtoAccount(acc)}, nil
 }
 
@@ -81,11 +103,11 @@ func (s *AccountServer) ListAccounts(ctx context.Context, req *accountv1.ListAcc
 	}
 
 	limit := int(req.PageSize)
-	if limit <= 0 {
-		limit = 20
-	}
-	if limit > 100 {
-		limit = 100
+	switch {
+	case limit <= 0:
+		limit = defaultPageSize
+	case limit > maxPageSize:
+		limit = maxPageSize
 	}
 
 	offset := 0
@@ -99,7 +121,8 @@ func (s *AccountServer) ListAccounts(ctx context.Context, req *accountv1.ListAcc
 
 	accounts, err := s.repo.ListAccounts(ctx, req.OwnerId, limit+1, offset)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "list accounts: %v", err)
+		s.log.Error().Err(err).Str("owner_id", req.OwnerId).Msg("list accounts failed")
+		return nil, status.Error(codes.Internal, "list accounts failed")
 	}
 
 	var nextToken string
@@ -108,168 +131,203 @@ func (s *AccountServer) ListAccounts(ctx context.Context, req *accountv1.ListAcc
 		nextToken = strconv.Itoa(offset + limit)
 	}
 
-	proto := make([]*accountv1.Account, len(accounts))
+	out := make([]*accountv1.Account, len(accounts))
 	for i, a := range accounts {
-		proto[i] = toProtoAccount(a)
+		out[i] = toProtoAccount(a)
 	}
-
-	return &accountv1.ListAccountsResponse{
-		Accounts:      proto,
-		NextPageToken: nextToken,
-	}, nil
+	return &accountv1.ListAccountsResponse{Accounts: out, NextPageToken: nextToken}, nil
 }
 
 // ── PlaceHold ─────────────────────────────────────────────────────────────────
 
 func (s *AccountServer) PlaceHold(ctx context.Context, req *accountv1.PlaceHoldRequest) (*accountv1.PlaceHoldResponse, error) {
-	if req.IdempotencyKey == "" {
+	switch {
+	case req.IdempotencyKey == "":
 		return nil, status.Error(codes.InvalidArgument, "idempotency_key required")
-	}
-	if req.AccountId == "" {
+	case req.AccountId == "":
 		return nil, status.Error(codes.InvalidArgument, "account_id required")
-	}
-	if req.Amount == nil {
+	case req.ReferenceId == "":
+		// The reference is the durable dedup key for the reservation.
+		return nil, status.Error(codes.InvalidArgument, "reference_id required")
+	case req.Amount == nil:
 		return nil, status.Error(codes.InvalidArgument, "amount required")
 	}
-	amt, err := parseAmount(req.Amount)
+
+	amount, err := money.Parse(req.Amount.Amount, req.Amount.Currency)
 	if err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "invalid amount: %v", err)
-	}
-	ttl := req.TtlSeconds
-	if ttl <= 0 {
-		ttl = 172800 // 48h default (T+2 settlement)
+		return nil, status.Errorf(codes.InvalidArgument, "amount: %v", err)
 	}
 
-	idemKey := "account:hold:" + req.IdempotencyKey
-	if existing, _ := s.idem.Get(ctx, idemKey); existing != nil {
-		return nil, status.Error(codes.AlreadyExists, "duplicate idempotency_key")
+	ttl := defaultHoldTTL
+	if req.TtlSeconds > 0 {
+		ttl = time.Duration(req.TtlSeconds) * time.Second
+	}
+	if ttl > maxHoldTTL {
+		return nil, status.Errorf(codes.InvalidArgument,
+			"ttl_seconds must not exceed %d (%s)", int64(maxHoldTTL.Seconds()), maxHoldTTL)
 	}
 
-	hold, err := s.repo.PlaceHold(ctx, req.AccountId, amt, req.ReferenceId, ttl)
-	if err != nil {
-		return nil, status.Errorf(codes.FailedPrecondition, "place hold: %v", err)
-	}
-
-	_ = s.idem.Set(ctx, idemKey, idempotency.Entry{StatusCode: 0, CreatedAt: time.Now()})
-
-	return &accountv1.PlaceHoldResponse{Hold: toProtoHold(hold)}, nil
+	return idemguard.Do(ctx, s.idem, s.log, "account:hold:"+req.IdempotencyKey,
+		func() *accountv1.PlaceHoldResponse { return &accountv1.PlaceHoldResponse{} },
+		func(ctx context.Context) (*accountv1.PlaceHoldResponse, error) {
+			hold, err := s.repo.PlaceHold(ctx, req.AccountId,
+				amount.Value(), string(amount.Currency()), req.ReferenceId, ttl)
+			if err != nil {
+				return nil, s.holdError(err, "place hold")
+			}
+			return &accountv1.PlaceHoldResponse{Hold: toProtoHold(hold)}, nil
+		})
 }
 
 // ── ReleaseHold ───────────────────────────────────────────────────────────────
 
 func (s *AccountServer) ReleaseHold(ctx context.Context, req *accountv1.ReleaseHoldRequest) (*accountv1.ReleaseHoldResponse, error) {
-	if req.HoldId == "" {
+	switch {
+	case req.HoldId == "":
 		return nil, status.Error(codes.InvalidArgument, "hold_id required")
-	}
-	if req.AccountId == "" {
+	case req.AccountId == "":
 		return nil, status.Error(codes.InvalidArgument, "account_id required")
 	}
 
 	if err := s.repo.ReleaseHold(ctx, req.HoldId, req.AccountId); err != nil {
-		return nil, status.Errorf(codes.FailedPrecondition, "release hold: %v", err)
+		// Releasing an already-resolved hold is reported as AlreadyExists rather
+		// than retried: a second release would return the funds twice.
+		if errors.Is(err, db.ErrHoldNotActive) {
+			return nil, status.Errorf(codes.AlreadyExists, "hold %s is already resolved", req.HoldId)
+		}
+		return nil, s.holdError(err, "release hold")
 	}
-
 	return &accountv1.ReleaseHoldResponse{}, nil
 }
 
 // ── CreditAccount ─────────────────────────────────────────────────────────────
 
 func (s *AccountServer) CreditAccount(ctx context.Context, req *accountv1.CreditAccountRequest) (*accountv1.CreditAccountResponse, error) {
-	if req.IdempotencyKey == "" {
+	switch {
+	case req.IdempotencyKey == "":
 		return nil, status.Error(codes.InvalidArgument, "idempotency_key required")
-	}
-	if req.AccountId == "" {
+	case req.AccountId == "":
 		return nil, status.Error(codes.InvalidArgument, "account_id required")
-	}
-	if req.Amount == nil {
+	case req.ReferenceId == "":
+		return nil, status.Error(codes.InvalidArgument, "reference_id required")
+	case req.Amount == nil:
 		return nil, status.Error(codes.InvalidArgument, "amount required")
 	}
-	amt, err := parseAmount(req.Amount)
+
+	amount, err := money.Parse(req.Amount.Amount, req.Amount.Currency)
 	if err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "invalid amount: %v", err)
+		return nil, status.Errorf(codes.InvalidArgument, "amount: %v", err)
 	}
 
-	idemKey := "account:credit:" + req.IdempotencyKey
-	if existing, _ := s.idem.Get(ctx, idemKey); existing != nil {
-		return nil, status.Error(codes.AlreadyExists, "duplicate idempotency_key")
-	}
-
-	acc, err := s.repo.CreditAccount(ctx, req.AccountId, amt)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "credit account: %v", err)
-	}
-
-	_ = s.idem.Set(ctx, idemKey, idempotency.Entry{StatusCode: 0, CreatedAt: time.Now()})
-
-	return &accountv1.CreditAccountResponse{Account: toProtoAccount(acc)}, nil
+	return idemguard.Do(ctx, s.idem, s.log, "account:credit:"+req.IdempotencyKey,
+		func() *accountv1.CreditAccountResponse { return &accountv1.CreditAccountResponse{} },
+		func(ctx context.Context) (*accountv1.CreditAccountResponse, error) {
+			acc, err := s.repo.CreditAccount(ctx, req.AccountId,
+				amount.Value(), string(amount.Currency()), req.ReferenceId)
+			if err != nil {
+				return nil, s.balanceError(err, "credit account")
+			}
+			return &accountv1.CreditAccountResponse{Account: toProtoAccount(acc)}, nil
+		})
 }
 
 // ── DebitAccount ──────────────────────────────────────────────────────────────
 
 func (s *AccountServer) DebitAccount(ctx context.Context, req *accountv1.DebitAccountRequest) (*accountv1.DebitAccountResponse, error) {
-	if req.IdempotencyKey == "" {
+	switch {
+	case req.IdempotencyKey == "":
 		return nil, status.Error(codes.InvalidArgument, "idempotency_key required")
-	}
-	if req.AccountId == "" {
+	case req.AccountId == "":
 		return nil, status.Error(codes.InvalidArgument, "account_id required")
-	}
-	if req.Amount == nil {
+	case req.ReferenceId == "":
+		return nil, status.Error(codes.InvalidArgument, "reference_id required")
+	case req.Amount == nil:
 		return nil, status.Error(codes.InvalidArgument, "amount required")
 	}
-	amt, err := parseAmount(req.Amount)
+
+	amount, err := money.Parse(req.Amount.Amount, req.Amount.Currency)
 	if err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "invalid amount: %v", err)
+		return nil, status.Errorf(codes.InvalidArgument, "amount: %v", err)
 	}
 
-	idemKey := "account:debit:" + req.IdempotencyKey
-	if existing, _ := s.idem.Get(ctx, idemKey); existing != nil {
-		return nil, status.Error(codes.AlreadyExists, "duplicate idempotency_key")
-	}
-
-	acc, err := s.repo.DebitAccount(ctx, req.AccountId, amt, req.HoldId)
-	if err != nil {
-		return nil, status.Errorf(codes.FailedPrecondition, "debit account: %v", err)
-	}
-
-	_ = s.idem.Set(ctx, idemKey, idempotency.Entry{StatusCode: 0, CreatedAt: time.Now()})
-
-	return &accountv1.DebitAccountResponse{Account: toProtoAccount(acc)}, nil
+	return idemguard.Do(ctx, s.idem, s.log, "account:debit:"+req.IdempotencyKey,
+		func() *accountv1.DebitAccountResponse { return &accountv1.DebitAccountResponse{} },
+		func(ctx context.Context) (*accountv1.DebitAccountResponse, error) {
+			acc, err := s.repo.DebitAccount(ctx, req.AccountId,
+				amount.Value(), string(amount.Currency()), req.HoldId, req.ReferenceId)
+			if err != nil {
+				return nil, s.balanceError(err, "debit account")
+			}
+			return &accountv1.DebitAccountResponse{Account: toProtoAccount(acc)}, nil
+		})
 }
 
-// ── helpers ───────────────────────────────────────────────────────────────────
+// ── error mapping ─────────────────────────────────────────────────────────────
 
-func parseAmount(m *commonv1.Money) (decimal.Decimal, error) {
-	if m.Amount == "" {
-		return decimal.Zero, fmt.Errorf("amount string empty")
+// holdError maps hold-related repository errors onto gRPC codes.
+func (s *AccountServer) holdError(err error, op string) error {
+	switch {
+	case errors.Is(err, db.ErrAccountNotFound):
+		return status.Error(codes.NotFound, "account not found")
+	case errors.Is(err, db.ErrHoldNotFound):
+		return status.Error(codes.NotFound, "hold not found")
+	case errors.Is(err, db.ErrAccountNotActive),
+		errors.Is(err, db.ErrInsufficientBalance),
+		errors.Is(err, db.ErrHoldNotActive),
+		errors.Is(err, db.ErrHoldExpired),
+		errors.Is(err, db.ErrHoldAmountMismatch):
+		return status.Error(codes.FailedPrecondition, err.Error())
+	case errors.Is(err, db.ErrCurrencyMismatch):
+		return status.Error(codes.InvalidArgument, err.Error())
+	case errors.Is(err, db.ErrDuplicateReference):
+		return status.Error(codes.AlreadyExists, err.Error())
+	default:
+		s.log.Error().Err(err).Msg(op + " failed")
+		return status.Error(codes.Internal, op+" failed")
 	}
-	d, err := decimal.NewFromString(m.Amount)
-	if err != nil {
-		return decimal.Zero, err
-	}
-	if d.LessThanOrEqual(decimal.Zero) {
-		return decimal.Zero, fmt.Errorf("amount must be positive")
-	}
-	return d, nil
 }
+
+// balanceError maps credit/debit repository errors onto gRPC codes.
+func (s *AccountServer) balanceError(err error, op string) error {
+	if errors.Is(err, db.ErrDuplicateMutation) {
+		// The mutation was already applied — the database caught a replay the
+		// idempotency cache missed. Report it rather than moving money twice.
+		return status.Error(codes.AlreadyExists, err.Error())
+	}
+	return s.holdError(err, op)
+}
+
+// ── proto conversion ──────────────────────────────────────────────────────────
 
 func toProtoAccount(a *db.Account) *accountv1.Account {
+	cur := money.Currency(a.Currency)
 	return &accountv1.Account{
-		Id:          a.ID,
-		OwnerId:     a.OwnerID,
-		Currency:    a.Currency,
-		Status:      toProtoStatus(a.Status),
-		Balance:     &commonv1.Money{Amount: a.Balance.StringFixed(4), Currency: a.Currency},
-		HoldBalance: &commonv1.Money{Amount: a.HoldBalance.StringFixed(4), Currency: a.Currency},
-		CreatedAt:   timestamppb.New(a.CreatedAt),
-		UpdatedAt:   timestamppb.New(a.UpdatedAt),
+		Id:       a.ID,
+		OwnerId:  a.OwnerID,
+		Currency: a.Currency,
+		Status:   toProtoStatus(a.Status),
+		Balance: &commonv1.Money{
+			Amount:   money.FromDecimal(a.Balance, cur).StringMinor(),
+			Currency: a.Currency,
+		},
+		HoldBalance: &commonv1.Money{
+			Amount:   money.FromDecimal(a.HoldBalance, cur).StringMinor(),
+			Currency: a.Currency,
+		},
+		CreatedAt: timestamppb.New(a.CreatedAt),
+		UpdatedAt: timestamppb.New(a.UpdatedAt),
 	}
 }
 
 func toProtoHold(h *db.Hold) *accountv1.Hold {
 	return &accountv1.Hold{
-		Id:          h.ID,
-		AccountId:   h.AccountID,
-		Amount:      &commonv1.Money{Amount: h.Amount.StringFixed(4)},
+		Id:        h.ID,
+		AccountId: h.AccountID,
+		Amount: &commonv1.Money{
+			Amount: money.FromDecimal(h.Amount, money.Currency(h.Currency)).StringMinor(),
+			// Previously omitted, so every hold came back with an empty currency.
+			Currency: h.Currency,
+		},
 		ReferenceId: h.ReferenceID,
 		ExpiresAt:   timestamppb.New(h.ExpiresAt),
 		CreatedAt:   timestamppb.New(h.CreatedAt),

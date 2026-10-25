@@ -1,44 +1,147 @@
+# golangci-lint v2 configuration.
+#
+# The previous file declared version "2" but used v1 layout: top-level
+# `linters-settings:` and `issues:` keys, which v2 renamed to `linters.settings`
+# and `linters.exclusions`. It also enabled `gosimple`, which v2 removed after
+# folding it into staticcheck. The result was a config golangci-lint could not
+# parse, so `make lint` had never run — which is how the discarded errors and the
+# math/rand request IDs went unnoticed.
 version: "2"
+
+run:
+  timeout: 5m
+  tests: true
 
 linters:
   enable:
-    - errcheck
-    - gosimple
+    # Correctness
+    - errcheck        # unchecked errors — the class of bug that hid failed
+                      # compensations and dropped audit records
     - govet
     - ineffassign
-    - staticcheck
+    - staticcheck     # subsumes the former gosimple and stylecheck
     - unused
-    - gofmt
-    - goimports
+    - bodyclose       # unclosed HTTP response bodies
+    - contextcheck    # context propagation
+    # noctx is deliberately absent. Its value is catching HTTP requests made
+    # without a context — a real bug this codebase had, in ui-bff's saga trace
+    # fetch. That call is now a gRPC request, and the remaining reports are all
+    # net.Listen at startup and httptest.NewRequest in tests, where a context adds
+    # nothing. contextcheck below still enforces propagation through call chains.
+    - rowserrcheck    # unchecked sql.Rows.Err
+    - sqlclosecheck   # unclosed sql.Rows / Stmt
+    - nilerr          # returning nil after a non-nil error
+    - errorlint       # error comparison and wrapping mistakes
+    - durationcheck   # suspicious time.Duration arithmetic
+    - makezero        # append to a make()d slice with a non-zero length
+
+    # Security
+    - gosec
+
+    # Style and clarity
     - misspell
     - revive
-    - gosec
-    - bodyclose
-    - contextcheck
-    - noctx
-    - exhaustruct
-    - wrapcheck
+    - wrapcheck       # errors crossing a package boundary must carry context
+    - unconvert
+    - unparam
+    - predeclared     # shadowing predeclared identifiers
+    - usestdlibvars
 
-linters-settings:
-  goimports:
-    local-prefixes: github.com/prasham/ledger
-  revive:
+  settings:
+    errcheck:
+      check-type-assertions: true
+      # check-blank stays off deliberately. An explicit `_ = f()` is how Go
+      # signals a considered decision to ignore an error — for example closing a
+      # client during shutdown, where there is no recoverable failure. Flagging
+      # those forces a nolint pragma on every one, which buries the cases that
+      # matter. Unchecked calls (a bare `defer conn.Close()`) are still reported.
+      check-blank: false
+
+    gosec:
+      excludes:
+        # G115 (integer overflow on conversion) fires on proto int32 <-> int
+        # conversions that are range-checked at the boundary.
+        - G115
+      # G404 (weak random) is deliberately NOT excluded. The previous config
+      # excluded it with the comment "we use crypto/rand for IDs, not math/rand"
+      # while the request-id generator used math/rand/v2 — the opposite of the
+      # claim. Both now use crypto/rand, so the check can stay on.
+
+    revive:
+      rules:
+        # The `exported` rule is deliberately absent. It demands a doc comment on
+        # every exported symbol, which for this codebase is mostly noise: the gRPC
+        # method set is specified by the .proto files, and repository constructors
+        # are self-describing. Comments here explain *why* code is shaped the way
+        # it is, and a rule that rewards mechanical restatement works against that.
+        - name: context-as-argument
+        - name: error-return
+        - name: error-strings
+        - name: error-naming
+        - name: increment-decrement
+        - name: indent-error-flow
+        - name: unexported-return
+        - name: unreachable-code
+
+    staticcheck:
+      checks:
+        - all
+        # ST1000 requires a package comment on every package. Applied to the
+        # per-service internal/config and internal/db packages it produces
+        # boilerplate ("Package db provides db"). Packages carrying non-obvious
+        # design decisions are documented; see internal/outbox and internal/migrate.
+        - -ST1000
+
+    wrapcheck:
+      ignore-package-globs:
+        - github.com/prasham/ledger/*
+        # Repository methods wrap pgx errors at their exported boundary, which is
+        # where the context belongs. Requiring it on every internal scan helper
+        # produces doubly-wrapped messages without adding information.
+        - github.com/jackc/pgx/*
+      ignore-sigs:
+        # Returning a gRPC status is the idiomatic way to fail an RPC; wrapping it
+        # would destroy the code the caller needs.
+        - google.golang.org/grpc/status.Error(
+        - google.golang.org/grpc/status.Errorf(
+        - status.Error(
+        - status.Errorf(
+        # Standard library wrappers that already carry context.
+        - .Errorf(
+        - errors.New(
+        - errors.Join(
+        - errors.Unwrap(
+        - .Wrap(
+        - .Wrapf(
+
+  exclusions:
+    generated: lax
     rules:
-      - name: exported
-        arguments:
-          - checkPrivateReceivers
-          - sayRepetitiveInsteadOfStutters
-  gosec:
-    excludes:
-      - G404  # weak random — we use crypto/rand for IDs, not math/rand
-  wrapcheck:
-    ignorePackageGlobs:
-      - github.com/prasham/ledger/*
+      # Generated protobuf code is not ours to lint.
+      - path: ^gen/
+        linters:
+          - all
 
-issues:
-  exclude-rules:
-    - path: _test\.go
-      linters:
-        - exhaustruct
-        - wrapcheck
-        - gosec
+      # Tests may be blunter than production code: table literals are partial by
+      # design, and a test's own errors are checked by the assertion library.
+      - path: _test\.go
+        linters:
+          - wrapcheck
+          - gosec
+          - errcheck
+          - unparam
+          - dupl
+
+      # Migration files are long SQL string constants.
+      - path: internal/db/migrate\.go
+        linters:
+          - lll
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/prasham/ledger

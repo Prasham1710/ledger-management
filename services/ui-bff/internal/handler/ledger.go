@@ -1,7 +1,6 @@
 package handler
 
 import (
-	"encoding/json"
 	"net/http"
 	"strconv"
 
@@ -9,36 +8,55 @@ import (
 	ledgerv1 "github.com/prasham/ledger/gen/ledger/v1"
 )
 
-func (h *Handler) getBalance(w http.ResponseWriter, r *http.Request) {
-	resp, err := h.ledger.GetBalance(r.Context(), &ledgerv1.GetBalanceRequest{
+func (h *Handler) getBalance(w http.ResponseWriter, r *http.Request, _ Identity) {
+	resp, err := h.clients.Ledger.GetBalance(r.Context(), &ledgerv1.GetBalanceRequest{
 		AccountId: r.PathValue("account_id"),
+		Currency:  r.URL.Query().Get("currency"),
 	})
 	if err != nil {
-		writeError(w, grpcStatus(err), err.Error())
+		h.writeGRPCError(w, r, err)
 		return
 	}
 	writeProto(w, http.StatusOK, resp)
 }
 
-func (h *Handler) listEntries(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) listEntries(w http.ResponseWriter, r *http.Request, _ Identity) {
+	// maxPageSize bounds the request before it is narrowed to int32. Parsing
+	// straight into int32 would wrap for large inputs, turning a huge page_size
+	// into a small or negative one.
+	const maxPageSize = 1000
+
 	pageSize := int32(20)
 	if ps := r.URL.Query().Get("page_size"); ps != "" {
-		if n, err := strconv.Atoi(ps); err == nil {
-			pageSize = int32(n)
+		n, err := strconv.ParseInt(ps, 10, 32)
+		if err != nil || n < 0 {
+			writeError(w, http.StatusBadRequest, "page_size must be a non-negative integer")
+			return
 		}
+		if n > maxPageSize {
+			n = maxPageSize
+		}
+		pageSize = int32(n)
 	}
-	resp, err := h.ledger.ListEntries(r.Context(), &ledgerv1.ListEntriesRequest{
+
+	resp, err := h.clients.Ledger.ListEntries(r.Context(), &ledgerv1.ListEntriesRequest{
 		AccountId: r.PathValue("account_id"),
 		PageSize:  pageSize,
+		PageToken: r.URL.Query().Get("page_token"),
 	})
 	if err != nil {
-		writeError(w, grpcStatus(err), err.Error())
+		h.writeGRPCError(w, r, err)
 		return
 	}
 	writeProto(w, http.StatusOK, resp)
 }
 
-func (h *Handler) postEntry(w http.ResponseWriter, r *http.Request) {
+// postEntry writes a raw double-entry pair, bypassing every saga.
+//
+// It is admin-only and always audited: an arbitrary ledger entry can assert a
+// transfer that no account balance reflects, which is exactly the discrepancy the
+// reconciliation worker exists to detect.
+func (h *Handler) postEntry(w http.ResponseWriter, r *http.Request, id Identity) {
 	var body struct {
 		IdempotencyKey  string `json:"idempotency_key"`
 		DebitAccountID  string `json:"debit_account_id"`
@@ -48,11 +66,11 @@ func (h *Handler) postEntry(w http.ResponseWriter, r *http.Request) {
 		ReferenceID     string `json:"reference_id"`
 		Description     string `json:"description"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON")
+	if !decodeJSON(w, r, &body) {
 		return
 	}
-	resp, err := h.ledger.PostEntry(r.Context(), &ledgerv1.PostEntryRequest{
+
+	resp, err := h.clients.Ledger.PostEntry(r.Context(), &ledgerv1.PostEntryRequest{
 		IdempotencyKey:  body.IdempotencyKey,
 		DebitAccountId:  body.DebitAccountID,
 		CreditAccountId: body.CreditAccountID,
@@ -61,8 +79,17 @@ func (h *Handler) postEntry(w http.ResponseWriter, r *http.Request) {
 		Description:     body.Description,
 	})
 	if err != nil {
-		writeError(w, grpcStatus(err), err.Error())
+		h.writeGRPCError(w, r, err)
 		return
 	}
+
+	h.log.Warn().
+		Str("actor", id.Subject).
+		Str("debit_account_id", body.DebitAccountID).
+		Str("credit_account_id", body.CreditAccountID).
+		Str("amount", body.Amount).
+		Str("currency", body.Currency).
+		Str("reference_id", body.ReferenceID).
+		Msg("raw ledger entry posted (outside any saga)")
 	writeProto(w, http.StatusCreated, resp)
 }

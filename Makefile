@@ -1,5 +1,33 @@
-.PHONY: help deps tidy test test-race lint build generate clean \
+.PHONY: help deps tidy test test-race test-cover lint lint-fix fmt vet build generate \
+        proto-lint proto-gen clean verify \
         infra-up infra-down infra-clean infra-logs infra-ps infra-wait
+
+# All Go modules in the workspace. ui-bff was previously missing from this list,
+# so `make tidy`, `make deps`, and `make build` all silently skipped it.
+MODULES := \
+	./gen \
+	./internal \
+	./services/ledger-svc \
+	./services/account-svc \
+	./services/fx-svc \
+	./services/transaction-svc \
+	./services/payout-svc \
+	./services/recon-worker \
+	./services/gateway \
+	./services/consumers \
+	./services/ui-bff
+
+# Buildable service binaries. ui-bff was previously missing here too.
+SERVICES := \
+	ledger-svc \
+	account-svc \
+	fx-svc \
+	transaction-svc \
+	payout-svc \
+	recon-worker \
+	gateway \
+	consumers \
+	ui-bff
 
 # Default target
 help:
@@ -16,76 +44,119 @@ help:
 	@echo "  Go:"
 	@echo "  make deps          Download all module dependencies"
 	@echo "  make tidy          Run go mod tidy in every module"
-	@echo "  make test          Run all tests (no race detector)"
+	@echo "  make fmt           Format all Go code"
+	@echo "  make vet           Run go vet in every module"
+	@echo "  make test          Run all tests"
 	@echo "  make test-race     Run all tests with -race"
+	@echo "  make test-cover    Run all tests and report coverage"
 	@echo "  make lint          Run golangci-lint"
 	@echo "  make build         Build all service binaries to ./bin/"
-	@echo "  make generate      Run buf generate + oapi-codegen"
+	@echo "  make generate      Regenerate protobuf code"
+	@echo "  make verify        fmt check + vet + lint + test-race (what CI runs)"
 	@echo "  make clean         Remove build artefacts"
-
-MODULES := \
-	./gen \
-	./internal \
-	./services/ledger-svc \
-	./services/account-svc \
-	./services/fx-svc \
-	./services/transaction-svc \
-	./services/payout-svc \
-	./services/recon-worker \
-	./services/gateway \
-	./services/consumers
 
 # Download dependencies for every module in the workspace.
 deps:
 	go work sync
 	@for mod in $(MODULES); do \
 		echo "==> go mod download $$mod"; \
-		(cd $$mod && go mod download); \
+		(cd $$mod && go mod download) || exit 1; \
 	done
 
 # Run go mod tidy in every module.
 tidy:
 	@for mod in $(MODULES); do \
 		echo "==> go mod tidy $$mod"; \
-		(cd $$mod && go mod tidy); \
+		(cd $$mod && go mod tidy) || exit 1; \
 	done
 
-# Run tests in all packages across the workspace.
+fmt:
+	gofmt -l -w $$(git ls-files '*.go' | grep -v '^gen/')
+
+# fmt-check fails when anything is unformatted, for CI.
+fmt-check:
+	@unformatted=$$(gofmt -l $$(git ls-files '*.go' | grep -v '^gen/')); \
+	if [ -n "$$unformatted" ]; then \
+	  echo "These files are not gofmt-formatted:"; echo "$$unformatted"; exit 1; \
+	fi
+	@echo "All files are formatted."
+
+# go vet every module.
+#
+# Iterating over modules is required: the repository root is not itself a module,
+# so `go vet ./...` from here fails with "directory prefix . does not contain
+# modules listed in go.work". The old `test` and `lint` targets did exactly that
+# and could never have run.
+vet:
+	@for mod in $(MODULES); do \
+		echo "==> go vet $$mod"; \
+		(cd $$mod && go vet ./...) || exit 1; \
+	done
+
+# Run tests in every module.
 test:
-	go test ./...
+	@failed=""; \
+	for mod in $(MODULES); do \
+		echo "━━━ $$mod ━━━"; \
+		(cd $$mod && go test ./...) || failed="$$failed $$mod"; \
+	done; \
+	if [ -n "$$failed" ]; then echo "FAILED:$$failed"; exit 1; fi; \
+	echo "All tests passed."
 
-# Run tests with race detector (use in CI).
+# Run tests with the race detector. Use this before committing.
 test-race:
-	go test -race -count=1 ./...
+	./scripts/test-all.sh
 
-# Run golangci-lint.
+test-cover:
+	@for mod in $(MODULES); do \
+		echo "━━━ $$mod ━━━"; \
+		(cd $$mod && go test -cover ./...) || exit 1; \
+	done
+
+# Run golangci-lint in every module.
 lint:
-	golangci-lint run ./...
+	@command -v golangci-lint >/dev/null 2>&1 || { \
+	  echo "golangci-lint is not installed."; \
+	  echo "Install it with: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest"; \
+	  exit 1; \
+	}
+	@for mod in $(MODULES); do \
+		echo "==> golangci-lint $$mod"; \
+		(cd $$mod && golangci-lint run ./...) || exit 1; \
+	done
+
+lint-fix:
+	@for mod in $(MODULES); do \
+		(cd $$mod && golangci-lint run --fix ./...) || exit 1; \
+	done
 
 # Build all service binaries.
-SERVICES := ledger-svc account-svc fx-svc transaction-svc payout-svc recon-worker gateway
-
 build: $(addprefix bin/, $(SERVICES))
 
 bin/%:
 	@mkdir -p bin
-	go build -o $@ ./services/$*/cmd/...
+	go build -ldflags="-s -w" -trimpath -o $@ ./services/$*/cmd/$*/
 
 # Lint proto files.
 proto-lint:
 	buf lint proto
 
-# Regenerate Go code from proto files.
-# Run this after any .proto change.
+# Regenerate Go code from proto files. Run this after any .proto change.
 proto-gen:
 	buf generate
 
-# Run buf generate (Part 4) and oapi-codegen (Part 10).
 generate: proto-gen
-	oapi-codegen -config services/gateway/openapi/.oapi-codegen.yaml services/gateway/openapi/api.yaml
 
+# What CI runs, so a green local run means a green pipeline.
+verify: fmt-check vet lint test-race
+
+# clean removes build artefacts.
+#
+# It no longer deletes gen/. That directory holds generated protobuf code which
+# is committed to the repository, and removing it left the workspace unbuildable
+# for anyone without buf installed.
 clean:
-	rm -rf bin/ gen/ coverage.txt coverage.html
+	rm -rf bin/ coverage.txt coverage.html
 
 # ─── Infrastructure targets ────────────────────────────────────────────────
 
@@ -113,7 +184,7 @@ infra-ps:
 
 # Block until every service with a healthcheck reports healthy.
 infra-wait:
-	@echo "Waiting for all services to be healthy..."
+	@echo "Waiting until all services are healthy..."
 	@until [ "$$(docker compose ps --format json | python3 -c \
 	  "import sys,json; data=[json.loads(l) for l in sys.stdin if l.strip()]; \
 	   unhealthy=[s['Name'] for s in data if s.get('Health','healthy') not in ('healthy','')]; \

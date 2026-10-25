@@ -1,15 +1,53 @@
 name: CI
 
+# The default branch is master. The previous workflow triggered on `main`, which
+# does not exist in this repository, so pushes to the default branch ran nothing.
 on:
   push:
-    branches: [main, "feature/**"]
+    branches: [master, main, "feature/**"]
   pull_request:
 
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  GO_VERSION: "1.26"
+
 jobs:
+  # ── Formatting ────────────────────────────────────────────────────────────
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: "**/go.sum"
+
+      - name: gofmt
+        run: make fmt-check
+
+  # ── Vet ───────────────────────────────────────────────────────────────────
+  vet:
+    name: Vet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: "**/go.sum"
+
+      # Iterates over modules. `go vet ./...` from the repository root cannot
+      # work: the root is not a module, so it fails with "directory prefix .
+      # does not contain modules listed in go.work".
+      - name: go vet (all modules)
+        run: make vet
+
   # ── Lint ──────────────────────────────────────────────────────────────────
   lint:
     name: Lint
@@ -19,23 +57,51 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.26"
+          go-version: ${{ env.GO_VERSION }}
           cache-dependency-path: "**/go.sum"
 
-      - name: go vet (all modules)
-        run: |
-          for mod in internal gen services/ledger-svc services/account-svc \
-              services/fx-svc services/transaction-svc services/payout-svc \
-              services/recon-worker services/gateway services/consumers \
-              services/ui-bff; do
-            echo "=== vet $mod ==="
-            (cd "$mod" && go vet ./...)
-          done
+      # golangci-lint was configured but never run in CI, which is why a config
+      # that could not even be parsed went unnoticed.
+      - name: Install golangci-lint
+        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
 
-      - name: Check go.sum up-to-date
+      - name: Verify lint config is valid
+        run: golangci-lint config verify
+        working-directory: internal
+
+      - name: golangci-lint (all modules)
+        run: make lint
+
+  # ── Generated code is current ─────────────────────────────────────────────
+  generated:
+    name: Generated code up to date
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: "**/go.sum"
+
+      - uses: bufbuild/buf-action@v1
+        with:
+          setup_only: true
+
+      - name: buf lint
+        run: buf lint proto
+
+      # gen/ is committed, so a .proto change with stale generated code must fail
+      # here rather than at someone else's build.
+      - name: Regenerate and diff
         run: |
-          go work sync
-          git diff --exit-code go.work.sum || (echo "go.work.sum is stale — run 'go work sync'" && exit 1)
+          buf generate
+          if ! git diff --quiet --exit-code -- gen/; then
+            echo "::error::gen/ is stale — run 'make generate' and commit the result."
+            git diff --stat -- gen/
+            exit 1
+          fi
+          echo "Generated code is current."
 
   # ── Unit Tests ────────────────────────────────────────────────────────────
   test:
@@ -46,7 +112,7 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.26"
+          go-version: ${{ env.GO_VERSION }}
           cache-dependency-path: "**/go.sum"
 
       - name: Run all unit tests
@@ -61,23 +127,48 @@ jobs:
 
       - uses: actions/setup-go@v5
         with:
-          go-version: "1.26"
+          go-version: ${{ env.GO_VERSION }}
           cache-dependency-path: "**/go.sum"
 
       - name: Build all services
-        run: |
-          mkdir -p bin
-          go build -ldflags="-s -w" -trimpath -o bin/ledger-svc      ./services/ledger-svc/cmd/ledger-svc/
-          go build -ldflags="-s -w" -trimpath -o bin/account-svc     ./services/account-svc/cmd/account-svc/
-          go build -ldflags="-s -w" -trimpath -o bin/fx-svc          ./services/fx-svc/cmd/fx-svc/
-          go build -ldflags="-s -w" -trimpath -o bin/transaction-svc ./services/transaction-svc/cmd/transaction-svc/
-          go build -ldflags="-s -w" -trimpath -o bin/payout-svc      ./services/payout-svc/cmd/payout-svc/
-          go build -ldflags="-s -w" -trimpath -o bin/recon-worker     ./services/recon-worker/cmd/recon-worker/
-          go build -ldflags="-s -w" -trimpath -o bin/gateway         ./services/gateway/cmd/gateway/
-          go build -ldflags="-s -w" -trimpath -o bin/consumers       ./services/consumers/cmd/consumers/
-          go build -ldflags="-s -w" -trimpath -o bin/ui-bff          ./services/ui-bff/cmd/ui-bff/
-          echo "All binaries built:"
-          ls -lh bin/
+        run: make build
+
+      - name: List binaries
+        run: ls -lh bin/
+
+  # ── Docker images build from a clean checkout ─────────────────────────────
+  docker-build:
+    name: Docker build ${{ matrix.service }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service:
+          - ledger-svc
+          - account-svc
+          - fx-svc
+          - transaction-svc
+          - payout-svc
+          - recon-worker
+          - gateway
+          - consumers
+          - ui-bff
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Build without pushing, so a broken Dockerfile fails on a pull request
+      # rather than at release time. Every image build previously failed on a
+      # clean checkout because gen/ and go.work.sum were gitignored while the
+      # Dockerfiles COPY both.
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: services/${{ matrix.service }}/Dockerfile
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
   # ── Helm lint ─────────────────────────────────────────────────────────────
   helm-lint:
@@ -99,3 +190,22 @@ jobs:
             --set global.imageTag=ci-test \
             --debug \
             > /dev/null
+
+      # The chart must not ship a usable default credential. This check exists
+      # because values.yaml previously committed admin/admin and
+      # JWT_SECRET=change-me-in-production as plain Deployment env vars.
+      - name: Reject placeholder credentials in rendered manifests
+        run: |
+          rendered=$(helm template ledger helm/ledger/ --set global.imageTag=ci-test)
+          fail=0
+          for bad in "change-me-in-production" "super-secret-ledger-jwt-key"; do
+            if echo "$rendered" | grep -q "$bad"; then
+              echo "::error::rendered manifests contain the placeholder secret '$bad'"
+              fail=1
+            fi
+          done
+          if echo "$rendered" | grep -A1 'ADMIN_PASSWORD' | grep -qE 'value:[[:space:]]*"?admin"?[[:space:]]*$'; then
+            echo "::error::rendered manifests set ADMIN_PASSWORD to 'admin'"
+            fail=1
+          fi
+          exit $fail

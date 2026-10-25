@@ -2,6 +2,7 @@ package db
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -9,6 +10,9 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/shopspring/decimal"
 )
+
+// ErrQuoteNotFound means no quote exists with the requested id.
+var ErrQuoteNotFound = errors.New("quote not found")
 
 type Rate struct {
 	FromCur    string
@@ -36,8 +40,12 @@ type Repo struct {
 
 func NewRepo(pool *pgxpool.Pool) *Repo { return &Repo{pool: pool} }
 
-// GetRate returns the active rate for a currency pair.
-// Returns nil if no valid rate exists (caller should return error to client).
+// GetRate returns the active rate for a currency pair, or (nil, nil) when no
+// unexpired rate exists.
+//
+// The valid_until filter is the staleness guard: an expired rate is treated as
+// absent rather than used, so a service left running with old market data
+// refuses to quote instead of quoting wrongly.
 func (r *Repo) GetRate(ctx context.Context, from, to string) (*Rate, error) {
 	rt := &Rate{}
 	err := r.pool.QueryRow(ctx, `
@@ -46,10 +54,25 @@ func (r *Repo) GetRate(ctx context.Context, from, to string) (*Rate, error) {
 		WHERE from_cur = $1 AND to_cur = $2 AND valid_until > NOW()`,
 		from, to,
 	).Scan(&rt.FromCur, &rt.ToCur, &rt.Rate, &rt.ValidUntil)
-	if err == pgx.ErrNoRows {
+	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
-	return rt, err
+	if err != nil {
+		return nil, fmt.Errorf("get rate %s->%s: %w", from, to, err)
+	}
+	return rt, nil
+}
+
+// ExpireQuotes deletes quotes that expired without being locked, keeping the
+// table bounded. Nothing previously removed them.
+func (r *Repo) ExpireQuotes(ctx context.Context, retain time.Duration) (int64, error) {
+	tag, err := r.pool.Exec(ctx, `
+		DELETE FROM fx.quotes
+		WHERE locked = FALSE AND expires_at < NOW() - $1::interval`, retain.String())
+	if err != nil {
+		return 0, fmt.Errorf("expire quotes: %w", err)
+	}
+	return tag.RowsAffected(), nil
 }
 
 // CreateQuote inserts a new unlocked quote and returns it.
@@ -75,7 +98,7 @@ func (r *Repo) LockQuote(ctx context.Context, quoteID, idempotencyKey string) (*
 	if err != nil {
 		return nil, false, err
 	}
-	defer tx.Rollback(ctx)
+	defer tx.Rollback(context.WithoutCancel(ctx)) //nolint:errcheck // no-op once committed
 
 	q := &Quote{}
 	err = tx.QueryRow(ctx, `
@@ -87,15 +110,19 @@ func (r *Repo) LockQuote(ctx context.Context, quoteID, idempotencyKey string) (*
 		quoteID,
 	).Scan(&q.ID, &q.FromCur, &q.ToCur, &q.Rate, &q.SourceAmount, &q.TargetAmount,
 		&q.Locked, &q.LockedBy, &q.ExpiresAt, &q.CreatedAt)
-	if err == pgx.ErrNoRows {
-		return nil, false, fmt.Errorf("quote not found")
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, false, ErrQuoteNotFound
 	}
 	if err != nil {
 		return nil, false, err
 	}
 
-	// Already locked by the same idempotency key → idempotent success
+	// Already locked by the same idempotency key: an idempotent retry. Commit so
+	// the FOR UPDATE lock is released cleanly rather than rolled back.
 	if q.Locked && q.LockedBy == idempotencyKey {
+		if err := tx.Commit(ctx); err != nil {
+			return nil, false, fmt.Errorf("commit idempotent lock replay: %w", err)
+		}
 		return q, true, nil
 	}
 

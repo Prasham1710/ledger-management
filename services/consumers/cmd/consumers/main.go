@@ -2,20 +2,19 @@ package main
 
 import (
 	"context"
-	"net/http"
 	"os"
 	"os/signal"
-	"strconv"
-	"strings"
 	"syscall"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/rs/zerolog"
-	"github.com/rs/zerolog/log"
 	"github.com/twmb/franz-go/pkg/kgo"
 
+	"github.com/prasham/ledger/internal/logging"
+	"github.com/prasham/ledger/internal/metrics"
+	"github.com/prasham/ledger/internal/serverkit"
+	"github.com/prasham/ledger/internal/tracing"
 	"github.com/prasham/ledger/services/consumers/internal/config"
 	"github.com/prasham/ledger/services/consumers/internal/consumer"
 	"github.com/prasham/ledger/services/consumers/internal/db"
@@ -23,80 +22,136 @@ import (
 	"github.com/prasham/ledger/services/consumers/internal/relay"
 )
 
+const serviceName = "consumers"
+
 func main() {
 	cfg := config.Load()
-	if cfg.LogPretty {
-		log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
-	}
+
+	logger := logging.New(logging.Config{
+		ServiceName: serviceName,
+		Level:       zerolog.InfoLevel,
+		Pretty:      cfg.LogPretty,
+	})
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	// Postgres pool
-	pool, err := pgxpool.New(ctx, cfg.DatabaseURL)
+	// ── Tracing ───────────────────────────────────────────────────────────────
+	shutdownTracing, err := tracing.Setup(ctx, tracing.Config{
+		ServiceName:    serviceName,
+		ServiceVersion: cfg.Version,
+	}, cfg.OTLPEndpoint)
 	if err != nil {
-		log.Fatal().Err(err).Msg("postgres connect failed")
+		logger.Fatal().Err(err).Msg("init tracing")
 	}
-	defer pool.Close()
-
-	if err := db.Migrate(ctx, pool); err != nil {
-		log.Fatal().Err(err).Msg("migration failed")
-	}
-	log.Info().Msg("migrations applied")
-
-	repo := db.NewRepo(pool)
-
-	// Kafka producer (for outbox relay)
-	producer, err := kgo.NewClient(
-		kgo.SeedBrokers(strings.Split(cfg.KafkaBrokers, ",")...),
-	)
-	if err != nil {
-		log.Fatal().Err(err).Msg("kafka producer init failed")
-	}
-	defer producer.Close()
-
-	// Outbox relay
-	relayInterval := 5 * time.Second
-	if secs, err := strconv.Atoi(cfg.RelayInterval); err == nil {
-		relayInterval = time.Duration(secs) * time.Second
-	}
-	outboxRelay := relay.NewOutboxRelay(repo, producer, relayInterval, log.Logger)
-
-	// Kafka consumer group
-	h := handler.New(repo, log.Logger)
-	cons, err := consumer.New(cfg.KafkaBrokers, cfg.KafkaGroupID, h, log.Logger)
-	if err != nil {
-		log.Fatal().Err(err).Msg("kafka consumer init failed")
-	}
-
-	// Metrics + healthz
-	metricsMux := http.NewServeMux()
-	metricsMux.Handle("/metrics", promhttp.Handler())
-	metricsMux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"status":"ok","service":"consumers"}`))
-	})
-	metricsSrv := &http.Server{Addr: ":" + cfg.MetricsPort, Handler: metricsMux}
-	go func() {
-		log.Info().Str("port", cfg.MetricsPort).Msg("metrics server starting")
-		if err := metricsSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Error().Err(err).Msg("metrics server error")
+	defer func() {
+		flushCtx, flushCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer flushCancel()
+		if err := shutdownTracing(flushCtx); err != nil {
+			logger.Warn().Err(err).Msg("flush traces")
 		}
 	}()
 
-	// Start relay + consumer
+	// ── Postgres ──────────────────────────────────────────────────────────────
+	pool, err := pgxpool.New(ctx, cfg.DatabaseURL)
+	if err != nil {
+		logger.Fatal().Err(err).Msg("connect postgres")
+	}
+	defer pool.Close()
+
+	if err := pool.Ping(ctx); err != nil {
+		logger.Fatal().Err(err).Msg("ping postgres")
+	}
+
+	if err := db.Migrate(ctx, pool); err != nil {
+		logger.Fatal().Err(err).Msg("migrate")
+	}
+	logger.Info().Msg("migrations applied")
+
+	repo := db.NewRepo(pool)
+
+	// ── Metrics ───────────────────────────────────────────────────────────────
+	reg := metrics.New()
+	outboxMetrics := metrics.NewOutboxMetrics(reg)
+	consumerMetrics := metrics.NewConsumerMetrics(reg)
+
+	// ── Kafka producer (outbox relay) ─────────────────────────────────────────
+	producer, err := kgo.NewClient(
+		kgo.SeedBrokers(cfg.KafkaBrokers...),
+		// Wait for all in-sync replicas before acknowledging: the relay marks a
+		// row published on the strength of this ack, so a weaker guarantee would
+		// let a leader failover lose an already-"published" event.
+		kgo.RequiredAcks(kgo.AllISRAcks()),
+		// Idempotent writes are franz-go's default and are required for
+		// AllISRAcks; they suppress broker-side duplicates from internal retries.
+		// Bound how long a produce may hang so the relay cannot stall forever.
+		kgo.RecordDeliveryTimeout(30*time.Second),
+	)
+	if err != nil {
+		logger.Fatal().Err(err).Msg("init kafka producer")
+	}
+	defer producer.Close()
+
+	if err := producer.Ping(ctx); err != nil {
+		logger.Fatal().Err(err).Strs("brokers", cfg.KafkaBrokers).Msg("ping kafka")
+	}
+
+	// ── Outbox relay ──────────────────────────────────────────────────────────
+	outboxRelay := relay.NewOutboxRelay(repo, producer, relay.Config{
+		Interval:       cfg.RelayInterval,
+		BatchSize:      cfg.RelayBatchSize,
+		Lease:          cfg.RelayLease,
+		PurgeRetention: cfg.PublishedRetention,
+		PurgeInterval:  cfg.PurgeInterval,
+	}, outboxMetrics, logger)
+
+	// ── Kafka consumer group ──────────────────────────────────────────────────
+	h := handler.New(repo, consumerMetrics, logger)
+	cons, err := consumer.New(cfg.KafkaBrokers, cfg.KafkaGroupID, h, repo, consumerMetrics, logger)
+	if err != nil {
+		logger.Fatal().Err(err).Msg("init kafka consumer")
+	}
+
+	// ── Admin HTTP ────────────────────────────────────────────────────────────
+	admin := serverkit.NewAdminServer(serverkit.AdminConfig{
+		Addr:        ":" + cfg.MetricsPort,
+		Registry:    reg,
+		ServiceName: serviceName,
+		Log:         logger,
+		Checks: []serverkit.Check{
+			serverkit.PostgresCheck(pool),
+			{
+				Name: "kafka",
+				Func: func(ctx context.Context) error { return producer.Ping(ctx) },
+			},
+		},
+	})
+	admin.Start()
+
+	// ── Start relay + consumer ────────────────────────────────────────────────
 	go outboxRelay.Run(ctx)
 	go cons.Run(ctx)
 
-	log.Info().
-		Str("brokers", cfg.KafkaBrokers).
+	logger.Info().
+		Strs("brokers", cfg.KafkaBrokers).
 		Str("group", cfg.KafkaGroupID).
 		Msg("consumers started")
 
 	<-ctx.Done()
+	logger.Info().Msg("shutdown signal received")
+
+	admin.Drain()
+
+	// Give the relay and consumer a moment to finish their current batch and
+	// commit, rather than dropping work mid-flight.
+	time.Sleep(500 * time.Millisecond)
 
 	shutCtx, shutCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutCancel()
-	_ = metricsSrv.Shutdown(shutCtx)
-	log.Info().Msg("consumers stopped")
+	if err := admin.Shutdown(shutCtx); err != nil {
+		logger.Warn().Err(err).Msg("admin server shutdown")
+	}
+
+	logger.Info().Msg("consumers stopped")
+	_ = os.Stdout.Sync()
 }

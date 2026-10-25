@@ -1,15 +1,13 @@
 package handler
 
 import (
-	"encoding/json"
-	"io"
 	"net/http"
 
 	commonv1 "github.com/prasham/ledger/gen/common/v1"
 	txnv1 "github.com/prasham/ledger/gen/transaction/v1"
 )
 
-func (h *Handler) initiatePayment(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) initiatePayment(w http.ResponseWriter, r *http.Request, id Identity) {
 	var body struct {
 		IdempotencyKey  string `json:"idempotency_key"`
 		SourceAccountID string `json:"source_account_id"`
@@ -18,11 +16,11 @@ func (h *Handler) initiatePayment(w http.ResponseWriter, r *http.Request) {
 		Currency        string `json:"currency"`
 		Description     string `json:"description"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON")
+	if !decodeJSON(w, r, &body) {
 		return
 	}
-	resp, err := h.txn.InitiatePayment(r.Context(), &txnv1.InitiatePaymentRequest{
+
+	resp, err := h.clients.Txn.InitiatePayment(r.Context(), &txnv1.InitiatePaymentRequest{
 		IdempotencyKey:  body.IdempotencyKey,
 		SourceAccountId: body.SourceAccountID,
 		DestAccountId:   body.DestAccountID,
@@ -30,32 +28,45 @@ func (h *Handler) initiatePayment(w http.ResponseWriter, r *http.Request) {
 		Description:     body.Description,
 	})
 	if err != nil {
-		writeError(w, grpcStatus(err), err.Error())
+		h.writeGRPCError(w, r, err)
 		return
 	}
+
+	h.log.Info().
+		Str("actor", id.Subject).
+		Str("source_account_id", body.SourceAccountID).
+		Str("dest_account_id", body.DestAccountID).
+		Str("amount", body.Amount).
+		Str("currency", body.Currency).
+		Msg("payment initiated")
 	writeProto(w, http.StatusCreated, resp)
 }
 
-func (h *Handler) getTransaction(w http.ResponseWriter, r *http.Request) {
-	resp, err := h.txn.GetTransaction(r.Context(), &txnv1.GetTransactionRequest{
+func (h *Handler) getTransaction(w http.ResponseWriter, r *http.Request, _ Identity) {
+	resp, err := h.clients.Txn.GetTransaction(r.Context(), &txnv1.GetTransactionRequest{
 		TransactionId: r.PathValue("id"),
 	})
 	if err != nil {
-		writeError(w, grpcStatus(err), err.Error())
+		h.writeGRPCError(w, r, err)
 		return
 	}
 	writeProto(w, http.StatusOK, resp)
 }
 
-func (h *Handler) getTransactionTrace(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	upstream, err := http.Get(h.txnAdminURL + "/trace/" + id)
+// getTransactionTrace returns a transaction with its saga steps.
+//
+// This is now a gRPC call. It previously issued a bare http.Get against
+// transaction-svc's *metrics* port, concatenating the path parameter into the URL
+// unescaped, with no timeout and without propagating the request context — so a
+// hung admin endpoint leaked connections indefinitely, and the trace data itself
+// was served from an unauthenticated port.
+func (h *Handler) getTransactionTrace(w http.ResponseWriter, r *http.Request, _ Identity) {
+	resp, err := h.clients.Txn.GetTransactionTrace(r.Context(), &txnv1.GetTransactionTraceRequest{
+		TransactionId: r.PathValue("id"),
+	})
 	if err != nil {
-		writeError(w, http.StatusBadGateway, "trace unavailable: "+err.Error())
+		h.writeGRPCError(w, r, err)
 		return
 	}
-	defer upstream.Body.Close()
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(upstream.StatusCode)
-	io.Copy(w, upstream.Body) //nolint:errcheck
+	writeProto(w, http.StatusOK, resp)
 }

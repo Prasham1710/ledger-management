@@ -1,52 +1,63 @@
 package config
 
 import (
-	"fmt"
-	"os"
-	"strconv"
+	"time"
+
+	"github.com/redis/go-redis/v9"
+
+	shared "github.com/prasham/ledger/internal/config"
 )
 
+// Config holds fx-svc runtime settings.
 type Config struct {
-	GRPCPort     int
-	MetricsPort  int
-	PostgresDSN  string
-	RedisAddr    string
-	OTLPEndpoint string
-	QuoteTTLSec  int // how long a quote is valid before it expires
+	GRPCPort    int
+	MetricsPort int
+	PostgresDSN string
+	Redis       *redis.Options
+
+	OTLPEndpoint     string
+	Version          string
+	EnableReflection bool
+
+	// QuoteTTL is how long a quote may be locked after being issued.
+	QuoteTTL time.Duration
+
+	// SeedRates inserts the development rate table on startup, for pairs that
+	// have no rate yet.
+	//
+	// Off in production. Seeding previously ran unconditionally with
+	// ON CONFLICT DO UPDATE, so every restart overwrote live market rates with
+	// hardcoded constants.
+	SeedRates bool
+
+	// QuoteRetention is how long expired unlocked quotes are kept before being
+	// purged.
+	QuoteRetention time.Duration
+	// QuotePurgeInterval is how often expired quotes are purged.
+	QuotePurgeInterval time.Duration
 }
 
-func Load() Config {
+// Load resolves configuration from the environment.
+func Load() (Config, error) {
+	redisOpts, err := shared.RedisOptions()
+	if err != nil {
+		return Config{}, err
+	}
 	return Config{
-		GRPCPort:     envInt("FX_GRPC_PORT", 50053),
-		MetricsPort:  envInt("FX_METRICS_PORT", 9103),
-		PostgresDSN:  buildDSN(),
-		RedisAddr:    envStr("REDIS_ADDR", "localhost:6379"),
-		OTLPEndpoint: envStr("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317"),
-		QuoteTTLSec:  envInt("FX_QUOTE_TTL_SEC", 30),
-	}
-}
+		GRPCPort:    shared.EnvInt("FX_GRPC_PORT", 50053),
+		MetricsPort: shared.EnvInt("FX_METRICS_PORT", 9103),
+		PostgresDSN: shared.PostgresDSN(),
+		Redis:       redisOpts,
 
-func buildDSN() string {
-	host := envStr("POSTGRES_HOST", "localhost")
-	port := envStr("POSTGRES_PORT", "5432")
-	user := envStr("POSTGRES_USER", "ledger")
-	pass := envStr("POSTGRES_PASSWORD", "ledger")
-	db   := envStr("POSTGRES_DB", "ledger")
-	return fmt.Sprintf("postgres://%s:%s@%s:%s/%s?sslmode=disable", user, pass, host, port, db)
-}
+		OTLPEndpoint:     shared.OTLPEndpoint(),
+		Version:          shared.Version(),
+		EnableReflection: shared.EnvBool("GRPC_REFLECTION", !shared.IsProduction()),
 
-func envStr(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return def
-}
+		QuoteTTL: shared.EnvDuration("FX_QUOTE_TTL_SEC", 30*time.Second),
+		// Default follows the environment: convenient locally, never in production.
+		SeedRates: shared.EnvBool("FX_SEED_RATES", !shared.IsProduction()),
 
-func envInt(key string, def int) int {
-	if v := os.Getenv(key); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			return n
-		}
-	}
-	return def
+		QuoteRetention:     shared.EnvDuration("FX_QUOTE_RETENTION", time.Hour),
+		QuotePurgeInterval: shared.EnvDuration("FX_QUOTE_PURGE_INTERVAL", 10*time.Minute),
+	}, nil
 }

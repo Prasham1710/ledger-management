@@ -1,8 +1,11 @@
 name: CD
 
+# The default branch is master. This previously triggered only on `main`, which
+# does not exist in this repository, so the workflow had never run.
 on:
   push:
-    branches: [main]
+    branches: [master]
+  workflow_dispatch:
 
 concurrency:
   group: cd-${{ github.ref }}
@@ -11,11 +14,34 @@ concurrency:
 env:
   REGISTRY: ghcr.io
   IMAGE_PREFIX: ghcr.io/${{ github.repository_owner }}/ledger
+  GO_VERSION: "1.26"
 
 jobs:
+  # ── Gate: never publish an image that fails the suite ─────────────────────
+  #
+  # The previous pipeline pushed images straight from a push event with no tests
+  # in front of it, so a broken commit shipped.
+  verify:
+    name: Verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: "**/go.sum"
+
+      - name: Install golangci-lint
+        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
+
+      - name: fmt, vet, lint, test
+        run: make verify
+
   # ── Build & push Docker images ────────────────────────────────────────────
   docker:
     name: Build & push ${{ matrix.service }}
+    needs: verify
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -63,14 +89,14 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
-          cache-to:   type=gha,mode=max
+          cache-to: type=gha,mode=max
 
   # ── Helm deploy (optional — requires KUBECONFIG secret) ──────────────────
   deploy:
     name: Helm deploy
     runs-on: ubuntu-latest
     needs: docker
-    if: vars.DEPLOY_ENABLED == 'true'   # set this repo variable to enable
+    if: vars.DEPLOY_ENABLED == 'true' # set this repo variable to enable
 
     steps:
       - uses: actions/checkout@v4
@@ -78,6 +104,42 @@ jobs:
       - uses: azure/setup-helm@v4
         with:
           version: "3.16.2"
+
+      # Fail before touching the cluster if a required secret is missing.
+      #
+      # Every one of these gates a security control that fails closed at runtime:
+      # the gateway refuses to start without JWT_SECRET and ADMIN_PASSWORD when
+      # APP_ENV=production, and ui-bff refuses to start without
+      # GATEWAY_UPSTREAM_SECRET. Deploying without them would CrashLoop, which is
+      # correct but a poor way to discover the omission.
+      - name: Check required secrets are present
+        env:
+          POSTGRES_URL: ${{ secrets.POSTGRES_URL }}
+          REDIS_URL: ${{ secrets.REDIS_URL }}
+          MINIO_ACCESS_KEY: ${{ secrets.MINIO_ACCESS_KEY }}
+          MINIO_SECRET_KEY: ${{ secrets.MINIO_SECRET_KEY }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+          ADMIN_PASSWORD: ${{ secrets.ADMIN_PASSWORD }}
+          GATEWAY_UPSTREAM_SECRET: ${{ secrets.GATEWAY_UPSTREAM_SECRET }}
+          SETTLEMENT_ENCRYPTION_KEY: ${{ secrets.SETTLEMENT_ENCRYPTION_KEY }}
+        run: |
+          missing=""
+          for name in POSTGRES_URL REDIS_URL MINIO_ACCESS_KEY MINIO_SECRET_KEY \
+                      JWT_SECRET ADMIN_PASSWORD GATEWAY_UPSTREAM_SECRET; do
+            if [ -z "$(printenv "$name")" ]; then missing="$missing $name"; fi
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::missing required repository secrets:$missing"
+            exit 1
+          fi
+          if [ "${#JWT_SECRET}" -lt 32 ]; then
+            echo "::error::JWT_SECRET must be at least 32 characters; the gateway rejects shorter secrets"
+            exit 1
+          fi
+          if [ -z "$SETTLEMENT_ENCRYPTION_KEY" ]; then
+            echo "::warning::SETTLEMENT_ENCRYPTION_KEY is unset — settlement files holding beneficiary bank details will be stored unencrypted"
+          fi
+          echo "All required secrets present."
 
       - name: Write kubeconfig
         run: |
@@ -92,19 +154,22 @@ jobs:
             --namespace ledger \
             --create-namespace \
             --set global.imageTag="${IMAGE_TAG}" \
+            --set global.appEnv="production" \
             --set global.postgres.url="${{ secrets.POSTGRES_URL }}" \
             --set global.redis.url="${{ secrets.REDIS_URL }}" \
             --set global.minio.accessKey="${{ secrets.MINIO_ACCESS_KEY }}" \
             --set global.minio.secretKey="${{ secrets.MINIO_SECRET_KEY }}" \
-            --set services.gateway.env.JWT_SECRET="${{ secrets.JWT_SECRET }}" \
-            --set services.gateway.env.ADMIN_PASSWORD="${{ secrets.ADMIN_PASSWORD }}" \
+            --set global.auth.jwtSecret="${{ secrets.JWT_SECRET }}" \
+            --set global.auth.adminPassword="${{ secrets.ADMIN_PASSWORD }}" \
+            --set global.auth.upstreamSecret="${{ secrets.GATEWAY_UPSTREAM_SECRET }}" \
+            --set global.settlement.encryptionKey="${{ secrets.SETTLEMENT_ENCRYPTION_KEY }}" \
             --atomic \
             --timeout 5m \
             --wait
 
       - name: Verify rollout
         run: |
-          kubectl rollout status deployment/gateway         -n ledger --timeout=2m
-          kubectl rollout status deployment/ledger-svc      -n ledger --timeout=2m
-          kubectl rollout status deployment/account-svc     -n ledger --timeout=2m
-          kubectl rollout status deployment/transaction-svc -n ledger --timeout=2m
+          for deployment in gateway ui-bff ledger-svc account-svc fx-svc \
+                            transaction-svc payout-svc recon-worker consumers; do
+            kubectl rollout status "deployment/$deployment" -n ledger --timeout=2m
+          done

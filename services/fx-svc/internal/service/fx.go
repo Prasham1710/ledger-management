@@ -2,9 +2,11 @@ package service
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"time"
 
+	"github.com/rs/zerolog"
 	"github.com/shopspring/decimal"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -12,126 +14,211 @@ import (
 
 	commonv1 "github.com/prasham/ledger/gen/common/v1"
 	fxv1 "github.com/prasham/ledger/gen/fx/v1"
+	"github.com/prasham/ledger/internal/idemguard"
 	"github.com/prasham/ledger/internal/idempotency"
+	"github.com/prasham/ledger/internal/money"
 	"github.com/prasham/ledger/services/fx-svc/internal/db"
 )
 
+// rateScale is the precision at which rates and derived inverses are held. It
+// matches the fx.rates column and money.StorageScale.
+const rateScale = 8
+
 type FXServer struct {
 	fxv1.UnimplementedFXServiceServer
-	repo    *db.Repo
-	idem    idempotency.Store
-	quoteTTL int
+	repo     *db.Repo
+	idem     idempotency.Store
+	quoteTTL time.Duration
+	log      zerolog.Logger
 }
 
-func NewFXServer(repo *db.Repo, idem idempotency.Store, quoteTTLSec int) *FXServer {
-	return &FXServer{repo: repo, idem: idem, quoteTTL: quoteTTLSec}
+func NewFXServer(repo *db.Repo, idem idempotency.Store, quoteTTL time.Duration, log zerolog.Logger) *FXServer {
+	if quoteTTL <= 0 {
+		quoteTTL = 30 * time.Second
+	}
+	return &FXServer{repo: repo, idem: idem, quoteTTL: quoteTTL, log: log}
 }
 
-// GetQuote looks up the FX rate for a currency pair, calculates the target
-// amount and stores an unlocked quote valid for quoteTTL seconds.
+// GetQuote prices a conversion and stores a short-lived quote.
+//
+// The target amount is quantized to the destination currency's minor unit, and
+// the residue that quantization discards is reported alongside it. Rounding an
+// FX result without accounting for the remainder is how unexplained
+// reconciliation drift accumulates.
 func (s *FXServer) GetQuote(ctx context.Context, req *fxv1.GetQuoteRequest) (*fxv1.GetQuoteResponse, error) {
 	from := strings.ToUpper(strings.TrimSpace(req.FromCurrency))
-	to   := strings.ToUpper(strings.TrimSpace(req.ToCurrency))
+	to := strings.ToUpper(strings.TrimSpace(req.ToCurrency))
 
-	if from == "" {
+	switch {
+	case from == "":
 		return nil, status.Error(codes.InvalidArgument, "from_currency required")
-	}
-	if to == "" {
+	case to == "":
 		return nil, status.Error(codes.InvalidArgument, "to_currency required")
-	}
-	if from == to {
+	case from == to:
 		return nil, status.Error(codes.InvalidArgument, "from_currency and to_currency must differ")
-	}
-	if req.SourceAmount == nil || req.SourceAmount.Amount == "" {
+	case req.SourceAmount == nil:
 		return nil, status.Error(codes.InvalidArgument, "source_amount required")
 	}
-	srcAmt, err := decimal.NewFromString(req.SourceAmount.Amount)
-	if err != nil || !srcAmt.IsPositive() {
-		return nil, status.Error(codes.InvalidArgument, "source_amount must be a positive decimal")
+
+	if err := money.Currency(to).Validate(); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "to_currency: %v", err)
+	}
+	// Parse validates the source currency, positivity, and minor-unit precision.
+	srcAmount, err := money.Parse(req.SourceAmount.Amount, from)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "source_amount: %v", err)
 	}
 
 	rate, err := s.resolveRate(ctx, from, to)
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "rate lookup: %v", err)
+		s.log.Error().Err(err).Str("pair", from+"->"+to).Msg("rate lookup failed")
+		return nil, status.Error(codes.Internal, "rate lookup failed")
 	}
 	if rate == nil {
-		return nil, status.Errorf(codes.NotFound, "no active rate for %s → %s", from, to)
+		// Either no rate exists, or the one that does has expired. Both mean the
+		// service cannot price this transfer, and quoting a stale rate would be
+		// worse than refusing.
+		return nil, status.Errorf(codes.FailedPrecondition,
+			"no currently valid rate for %s → %s", from, to)
 	}
 
-	tgtAmt := srcAmt.Mul(rate.Rate).Round(4)
+	// Convert at full storage precision, then quantize to the target currency.
+	rawTarget := money.FromDecimal(srcAmount.Value().Mul(rate.Rate), money.Currency(to))
+	target, residue := rawTarget.Quantize()
 
-	quote, err := s.repo.CreateQuote(ctx, from, to, rate.Rate, srcAmt, tgtAmt, s.quoteTTL)
+	if target.IsZero() {
+		// The converted value rounds away entirely — e.g. a fraction of a yen.
+		return nil, status.Errorf(codes.InvalidArgument,
+			"converting %s at %s yields less than the smallest unit of %s",
+			srcAmount, rate.Rate.StringFixed(rateScale), to)
+	}
+
+	quote, err := s.repo.CreateQuote(ctx, from, to, rate.Rate,
+		srcAmount.Value(), target.Value(), int(s.quoteTTL.Seconds()))
 	if err != nil {
-		return nil, status.Errorf(codes.Internal, "create quote: %v", err)
+		s.log.Error().Err(err).Msg("create quote failed")
+		return nil, status.Error(codes.Internal, "create quote failed")
+	}
+
+	if !residue.IsZero() {
+		// Visible rather than silent: summed across a batch this is real money.
+		s.log.Debug().
+			Str("quote_id", quote.ID).
+			Str("pair", from+"->"+to).
+			Str("residue", residue.StringFixed()).
+			Msg("fx conversion rounded to the target currency's minor unit")
 	}
 
 	return &fxv1.GetQuoteResponse{Quote: toProtoQuote(quote)}, nil
 }
 
-// LockQuote atomically reserves a quote for one transaction.
-// Returns locked=true on success, locked=false if the quote is expired or already used.
+// LockQuote reserves a quote for one transaction.
+//
+// The repository already implements this idempotently: a quote locked by the same
+// key reports success. The idempotency guard sits in front only to collapse
+// concurrent duplicates and to replay the response — it must not convert a
+// legitimate retry into an error, which is what the previous pre-check did by
+// returning AlreadyExists and thereby breaking the correct database behaviour
+// underneath it.
 func (s *FXServer) LockQuote(ctx context.Context, req *fxv1.LockQuoteRequest) (*fxv1.LockQuoteResponse, error) {
-	if req.IdempotencyKey == "" {
+	switch {
+	case req.IdempotencyKey == "":
 		return nil, status.Error(codes.InvalidArgument, "idempotency_key required")
-	}
-	if req.QuoteId == "" {
+	case req.QuoteId == "":
 		return nil, status.Error(codes.InvalidArgument, "quote_id required")
 	}
 
-	idemKey := "fx:lock:" + req.IdempotencyKey
-	if existing, _ := s.idem.Get(ctx, idemKey); existing != nil {
-		return nil, status.Error(codes.AlreadyExists, "duplicate idempotency_key")
-	}
+	return idemguard.Do(ctx, s.idem, s.log, "fx:lock:"+req.IdempotencyKey,
+		func() *fxv1.LockQuoteResponse { return &fxv1.LockQuoteResponse{} },
+		func(ctx context.Context) (*fxv1.LockQuoteResponse, error) {
+			quote, locked, err := s.repo.LockQuote(ctx, req.QuoteId, req.IdempotencyKey)
+			if err != nil {
+				if errors.Is(err, db.ErrQuoteNotFound) {
+					return nil, status.Errorf(codes.NotFound, "quote %s not found", req.QuoteId)
+				}
+				s.log.Error().Err(err).Str("quote_id", req.QuoteId).Msg("lock quote failed")
+				return nil, status.Error(codes.Internal, "lock quote failed")
+			}
 
-	quote, locked, err := s.repo.LockQuote(ctx, req.QuoteId, req.IdempotencyKey)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "lock quote: %v", err)
-	}
+			if !locked {
+				// Expired or already consumed by a different transaction. This is a
+				// precondition failure, not a transient error: the caller must
+				// request a fresh quote.
+				return nil, status.Errorf(codes.FailedPrecondition,
+					"quote %s is expired or already locked by another transaction", req.QuoteId)
+			}
 
-	if locked {
-		_ = s.idem.Set(ctx, idemKey, idempotency.Entry{StatusCode: 0, CreatedAt: time.Now()})
-	}
-
-	return &fxv1.LockQuoteResponse{
-		Quote:  toProtoQuote(quote),
-		Locked: locked,
-	}, nil
+			return &fxv1.LockQuoteResponse{
+				Quote:  toProtoQuote(quote),
+				Locked: true,
+			}, nil
+		})
 }
 
-// resolveRate looks up a direct rate first, then tries the inverse.
+// resolveRate finds a rate for the pair, deriving the inverse when only the
+// opposite direction is stored.
+//
+// Deriving 1/rate rather than reading a separately stored inverse guarantees the
+// two directions are exactly reciprocal. The seed table previously held both
+// directions as independently rounded constants — 83.5 and 0.01198, where 1/83.5
+// is 0.011976 — so a round trip through both created value.
+//
+// A real platform applies a spread here; this derivation is deliberately exact so
+// that when a spread is introduced it is explicit and auditable rather than an
+// artefact of rounding.
 func (s *FXServer) resolveRate(ctx context.Context, from, to string) (*db.Rate, error) {
-	rate, err := s.repo.GetRate(ctx, from, to)
-	if err != nil || rate != nil {
-		return rate, err
-	}
-
-	// Try inverse: rate(A→B) = 1 / rate(B→A)
-	inv, err := s.repo.GetRate(ctx, to, from)
-	if err != nil || inv == nil {
+	direct, err := s.repo.GetRate(ctx, from, to)
+	if err != nil {
 		return nil, err
 	}
-	invRate := decimal.NewFromInt(1).Div(inv.Rate).Round(8)
+	if direct != nil {
+		return direct, nil
+	}
+
+	inverse, err := s.repo.GetRate(ctx, to, from)
+	if err != nil {
+		return nil, err
+	}
+	if inverse == nil {
+		return nil, nil
+	}
+	if inverse.Rate.IsZero() {
+		// Guarded by a CHECK constraint on the column, but dividing by a stored
+		// zero would panic rather than return an error.
+		return nil, errors.New("stored rate is zero; cannot derive its inverse")
+	}
+
 	return &db.Rate{
 		FromCur:    from,
 		ToCur:      to,
-		Rate:       invRate,
-		ValidUntil: inv.ValidUntil,
+		Rate:       decimal.NewFromInt(1).DivRound(inverse.Rate, rateScale),
+		ValidUntil: inverse.ValidUntil,
 	}, nil
 }
 
 // ── proto helpers ─────────────────────────────────────────────────────────────
 
 func toProtoQuote(q *db.Quote) *fxv1.Quote {
+	if q == nil {
+		return nil
+	}
+	srcCur := money.Currency(q.FromCur)
+	dstCur := money.Currency(q.ToCur)
 	return &fxv1.Quote{
 		Id:           q.ID,
 		FromCurrency: q.FromCur,
 		ToCurrency:   q.ToCur,
-		Rate:         q.Rate.StringFixed(8),
-		SourceAmount: &commonv1.Money{Amount: q.SourceAmount.StringFixed(4), Currency: q.FromCur},
-		TargetAmount: &commonv1.Money{Amount: q.TargetAmount.StringFixed(4), Currency: q.ToCur},
-		Locked:       q.Locked,
-		ExpiresAt:    timestamppb.New(q.ExpiresAt),
-		CreatedAt:    timestamppb.New(q.CreatedAt),
+		Rate:         q.Rate.StringFixed(rateScale),
+		SourceAmount: &commonv1.Money{
+			Amount:   money.FromDecimal(q.SourceAmount, srcCur).StringMinor(),
+			Currency: q.FromCur,
+		},
+		TargetAmount: &commonv1.Money{
+			Amount:   money.FromDecimal(q.TargetAmount, dstCur).StringMinor(),
+			Currency: q.ToCur,
+		},
+		Locked:    q.Locked,
+		ExpiresAt: timestamppb.New(q.ExpiresAt),
+		CreatedAt: timestamppb.New(q.CreatedAt),
 	}
 }
-

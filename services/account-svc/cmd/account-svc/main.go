@@ -2,9 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
-	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -19,25 +19,50 @@ import (
 	"google.golang.org/grpc/reflection"
 
 	accountv1 "github.com/prasham/ledger/gen/account/v1"
+	"github.com/prasham/ledger/internal/grpcmw"
 	"github.com/prasham/ledger/internal/idempotency"
 	"github.com/prasham/ledger/internal/logging"
 	"github.com/prasham/ledger/internal/metrics"
+	"github.com/prasham/ledger/internal/serverkit"
+	"github.com/prasham/ledger/internal/tracing"
 	"github.com/prasham/ledger/services/account-svc/internal/config"
 	"github.com/prasham/ledger/services/account-svc/internal/db"
 	"github.com/prasham/ledger/services/account-svc/internal/service"
+	"github.com/prasham/ledger/services/account-svc/internal/sweeper"
 )
 
-func main() {
-	cfg := config.Load()
+const serviceName = "account-svc"
 
+func main() {
 	log := logging.New(logging.Config{
-		ServiceName: "account-svc",
+		ServiceName: serviceName,
 		Level:       zerolog.InfoLevel,
 		Pretty:      os.Getenv("LOG_PRETTY") == "true",
 	})
 
+	cfg, err := config.Load()
+	if err != nil {
+		log.Fatal().Err(err).Msg("load config")
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	// ── Tracing ───────────────────────────────────────────────────────────────
+	shutdownTracing, err := tracing.Setup(ctx, tracing.Config{
+		ServiceName:    serviceName,
+		ServiceVersion: cfg.Version,
+	}, cfg.OTLPEndpoint)
+	if err != nil {
+		log.Fatal().Err(err).Msg("init tracing")
+	}
+	defer func() {
+		flushCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := shutdownTracing(flushCtx); err != nil {
+			log.Warn().Err(err).Msg("flush traces")
+		}
+	}()
 
 	// ── PostgreSQL ────────────────────────────────────────────────────────────
 	pool, err := pgxpool.New(ctx, cfg.PostgresDSN)
@@ -56,30 +81,47 @@ func main() {
 	log.Info().Msg("migrations applied")
 
 	// ── Redis ─────────────────────────────────────────────────────────────────
-	rdb := redis.NewClient(&redis.Options{Addr: cfg.RedisAddr})
-	defer rdb.Close()
+	rdb := redis.NewClient(cfg.Redis)
+	defer func() { _ = rdb.Close() }()
 
 	if err := rdb.Ping(ctx).Err(); err != nil {
 		log.Fatal().Err(err).Msg("ping redis")
 	}
-
 	idemStore := idempotency.NewRedisStore(rdb)
 
 	// ── Metrics ───────────────────────────────────────────────────────────────
 	reg := metrics.New()
+	rpcMetrics := metrics.NewRPCMetrics(reg)
+	sweepMetrics := sweeper.NewMetrics(reg)
+
+	repo := db.NewRepo(pool)
+
+	// ── Hold expiry sweeper ───────────────────────────────────────────────────
+	// Without this, a saga that dies between PlaceHold and settlement reserves
+	// the caller's funds permanently.
+	holdSweeper := sweeper.New(repo, sweeper.Config{
+		Interval:  cfg.HoldSweepInterval,
+		BatchSize: cfg.HoldSweepBatchSize,
+	}, sweepMetrics, log)
+	go holdSweeper.Run(ctx)
 
 	// ── gRPC server ───────────────────────────────────────────────────────────
-	repo := db.NewRepo(pool)
-	svc := service.NewAccountServer(repo, idemStore)
+	svc := service.NewAccountServer(repo, idemStore, log)
 
-	grpcSrv := grpc.NewServer()
+	grpcSrv := grpc.NewServer(grpcmw.ServerOptions(grpcmw.Deps{
+		Log:     log,
+		Metrics: rpcMetrics,
+	})...)
 	accountv1.RegisterAccountServiceServer(grpcSrv, svc)
 
 	healthSrv := health.NewServer()
 	grpc_health_v1.RegisterHealthServer(grpcSrv, healthSrv)
 	healthSrv.SetServingStatus("account.v1.AccountService", grpc_health_v1.HealthCheckResponse_SERVING)
 
-	reflection.Register(grpcSrv)
+	if cfg.EnableReflection {
+		reflection.Register(grpcSrv)
+		log.Warn().Msg("gRPC reflection enabled — do not enable in production")
+	}
 
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", cfg.GRPCPort))
 	if err != nil {
@@ -88,39 +130,45 @@ func main() {
 
 	go func() {
 		log.Info().Int("port", cfg.GRPCPort).Msg("gRPC listening")
-		if err := grpcSrv.Serve(lis); err != nil {
+		if err := grpcSrv.Serve(lis); err != nil && !errors.Is(err, grpc.ErrServerStopped) {
 			log.Error().Err(err).Msg("grpc serve")
 		}
 	}()
 
-	// ── Metrics + health HTTP ─────────────────────────────────────────────────
-	mux := http.NewServeMux()
-	mux.Handle("/metrics", reg.Handler())
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
+	// ── Admin HTTP (metrics, liveness, readiness) ─────────────────────────────
+	admin := serverkit.NewAdminServer(serverkit.AdminConfig{
+		Addr:        fmt.Sprintf(":%d", cfg.MetricsPort),
+		Registry:    reg,
+		ServiceName: serviceName,
+		Log:         log,
+		Checks: []serverkit.Check{
+			serverkit.PostgresCheck(pool),
+			{
+				Name: "redis",
+				// Redis backs idempotency and the service fails closed without
+				// it, so an unreachable Redis means this replica cannot serve
+				// writes and must leave the load balancer rotation.
+				Func: func(ctx context.Context) error { return rdb.Ping(ctx).Err() },
+			},
+		},
 	})
-
-	httpSrv := &http.Server{
-		Addr:    fmt.Sprintf(":%d", cfg.MetricsPort),
-		Handler: mux,
-	}
-
-	go func() {
-		log.Info().Int("port", cfg.MetricsPort).Msg("metrics HTTP listening")
-		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Error().Err(err).Msg("metrics serve")
-		}
-	}()
+	admin.Start()
 
 	// ── Graceful shutdown ─────────────────────────────────────────────────────
 	<-ctx.Done()
 	log.Info().Msg("shutdown signal received")
 
+	// Report unready before draining so peers stop routing new work here.
+	admin.Drain()
+	healthSrv.SetServingStatus("account.v1.AccountService", grpc_health_v1.HealthCheckResponse_NOT_SERVING)
+
 	grpcSrv.GracefulStop()
 
 	shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	_ = httpSrv.Shutdown(shutCtx)
+	if err := admin.Shutdown(shutCtx); err != nil {
+		log.Warn().Err(err).Msg("admin server shutdown")
+	}
 
 	log.Info().Msg("stopped")
 }

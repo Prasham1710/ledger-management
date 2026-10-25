@@ -41,8 +41,32 @@ message PostEntryResponse {
   Entry credit_entry = 2;
 }
 
+// ReverseEntryRequest asks the ledger to neutralise a previously posted pair.
+//
+// The ledger is append-only: reversal posts a mirror-image debit/credit pair
+// referencing the same reference_id, it never deletes or mutates rows. Posting
+// a reversal twice for the same reference_id is rejected, so a saga may safely
+// retry its compensating action.
+message ReverseEntryRequest {
+  string idempotency_key = 1;
+  // reference_id identifies the original entry pair (transaction or payout id).
+  string reference_id = 2;
+  // reason is recorded in the reversal entries' description for audit.
+  string reason = 3;
+}
+
+message ReverseEntryResponse {
+  // The mirror-image pair that neutralises the original.
+  Entry debit_entry  = 1;
+  Entry credit_entry = 2;
+}
+
 message GetBalanceRequest {
   string account_id = 1;
+  // currency scopes the projection. An account's entries are constrained to a
+  // single currency, so this is optional; when set it is verified against the
+  // stored entries and a mismatch is an error.
+  string currency = 2;
 }
 
 message GetBalanceResponse {
@@ -62,7 +86,10 @@ message ListEntriesResponse {
 }
 
 service LedgerService {
-  rpc PostEntry   (PostEntryRequest)   returns (PostEntryResponse);
-  rpc GetBalance  (GetBalanceRequest)  returns (GetBalanceResponse);
-  rpc ListEntries (ListEntriesRequest) returns (ListEntriesResponse);
+  rpc PostEntry    (PostEntryRequest)    returns (PostEntryResponse);
+  // ReverseEntry posts a compensating mirror pair for an existing reference_id.
+  // Sagas call this to undo a ledger write when a later step fails.
+  rpc ReverseEntry (ReverseEntryRequest) returns (ReverseEntryResponse);
+  rpc GetBalance   (GetBalanceRequest)   returns (GetBalanceResponse);
+  rpc ListEntries  (ListEntriesRequest)  returns (ListEntriesResponse);
 }

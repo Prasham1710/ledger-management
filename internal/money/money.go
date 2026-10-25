@@ -32,6 +32,44 @@ func MustNew(value string, currency Currency) Amount {
 	return a
 }
 
+// Parse validates and converts an untrusted (amount, currency) pair arriving
+// from the wire. It is the single entry point for external money values, and
+// enforces every invariant the ledger depends on:
+//
+//   - currency is a supported ISO 4217 code
+//   - amount is a well-formed decimal
+//   - amount is strictly positive (the ledger encodes direction with
+//     DEBIT/CREDIT, never with a sign)
+//   - amount carries no precision finer than the currency's minor unit, so
+//     sub-minor residue cannot enter the system undetected
+//
+// Callers should surface the returned error as an invalid-argument response.
+func Parse(amount, currency string) (Amount, error) {
+	if currency == "" {
+		return Amount{}, fmt.Errorf("money.Parse: currency is required")
+	}
+	cur := Currency(currency)
+	if err := cur.Validate(); err != nil {
+		return Amount{}, fmt.Errorf("money.Parse: %w", err)
+	}
+	if amount == "" {
+		return Amount{}, fmt.Errorf("money.Parse: amount is required")
+	}
+	a, err := New(amount, cur)
+	if err != nil {
+		return Amount{}, err
+	}
+	if !a.IsPositive() {
+		return Amount{}, fmt.Errorf("money.Parse: amount must be positive, got %s", a.value.String())
+	}
+	if !a.IsQuantized() {
+		return Amount{}, fmt.Errorf(
+			"money.Parse: amount %s has finer precision than %s allows (%d decimal places)",
+			a.value.String(), cur, cur.Scale())
+	}
+	return a, nil
+}
+
 // FromDecimal wraps an existing decimal.Decimal with a currency.
 func FromDecimal(d decimal.Decimal, currency Currency) Amount {
 	return Amount{value: d, currency: currency}
@@ -96,12 +134,44 @@ func (a Amount) LessThan(b Amount) bool {
 	return a.value.LessThan(b.value)
 }
 
-// StringFixed returns the value as a string with exactly 4 decimal places.
-func (a Amount) StringFixed() string { return a.value.StringFixed(4) }
+// Div returns a divided by scalar, rounded to StorageScale.
+// Returns an error rather than panicking on division by zero.
+func (a Amount) Div(scalar decimal.Decimal) (Amount, error) {
+	if scalar.IsZero() {
+		return Amount{}, fmt.Errorf("money.Div: division by zero")
+	}
+	return Amount{value: a.value.DivRound(scalar, StorageScale), currency: a.currency}, nil
+}
 
-// String returns "100.0000 INR" style representation.
+// IsQuantized reports whether a is expressible in its currency's minor unit —
+// that is, whether it carries no precision finer than the currency allows.
+func (a Amount) IsQuantized() bool {
+	return a.value.Equal(a.value.Truncate(a.currency.Scale()))
+}
+
+// Quantize rounds a to its currency's minor unit and returns the rounded amount
+// alongside the residue that rounding discarded (original minus rounded).
+//
+// Callers converting between currencies must not drop the residue: summed
+// across a batch it is real money, and an unaccounted residue is exactly the
+// kind of drift the reconciliation worker exists to catch. Rounding is
+// half-away-from-zero, matching the decimal library's Round.
+func (a Amount) Quantize() (rounded, residue Amount) {
+	r := Amount{value: a.value.Round(a.currency.Scale()), currency: a.currency}
+	return r, Amount{value: a.value.Sub(r.value), currency: a.currency}
+}
+
+// StringFixed returns the value at StorageScale — the full precision held in
+// the database. Use StringMinor for values crossing an API boundary.
+func (a Amount) StringFixed() string { return a.value.StringFixed(StorageScale) }
+
+// StringMinor returns the value at its currency's minor-unit scale, e.g.
+// "100.00" for INR and "100" for JPY. This is the canonical wire format.
+func (a Amount) StringMinor() string { return a.value.StringFixed(a.currency.Scale()) }
+
+// String returns "100.00 INR" style representation at minor-unit scale.
 func (a Amount) String() string {
-	return fmt.Sprintf("%s %s", a.value.StringFixed(4), a.currency)
+	return fmt.Sprintf("%s %s", a.StringMinor(), a.currency)
 }
 
 func (a Amount) requireSameCurrency(b Amount) {

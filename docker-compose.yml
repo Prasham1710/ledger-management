@@ -201,8 +201,12 @@ services:
     restart: "no"
 
   # ── Debezium Connect ──────────────────────────────────────────────────────
-  # Tails the Postgres WAL via logical replication.
-  # Transforms outbox table rows into Kafka messages (transactional outbox pattern).
+  # Available CDC infrastructure. Starts with NO connectors registered.
+  #
+  # It must not subscribe to any *.outbox_messages table. Event publication is
+  # owned solely by the Go outbox relay in services/consumers; a Debezium
+  # connector over the same tables produced every event twice, in two different
+  # envelope shapes, and raced the relay. See infra/debezium/README.md.
   # REST API: http://localhost:8083
   debezium:
     image: debezium/connect:2.7.3.Final
@@ -235,24 +239,6 @@ services:
       timeout: 10s
       retries: 20
       start_period: 30s
-
-  # Connector registration — one-shot after Debezium is healthy.
-  # Postgres credentials are passed as env vars — never stored in the JSON file.
-  debezium-init:
-    image: curlimages/curl:8.10.1
-    container_name: ledger-debezium-init
-    networks: [ledger-net]
-    depends_on:
-      debezium:
-        condition: service_healthy
-    entrypoint: ["/bin/sh", "/scripts/register-connector.sh"]
-    environment:
-      POSTGRES_USER:     ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_DB:       ${POSTGRES_DB}
-    volumes:
-      - ./infra/debezium:/scripts:ro
-    restart: "no"
 
   # ── pgAdmin 4 ─────────────────────────────────────────────────────────────
   # Browser UI for PostgreSQL — query editor, schema browser, table viewer.

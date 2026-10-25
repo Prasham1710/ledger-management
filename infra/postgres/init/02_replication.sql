@@ -1,20 +1,58 @@
--- Logical replication setup for Debezium CDC.
+-- Logical replication setup.
+--
 -- wal_level=logical is set via postgres command flags in docker-compose.
 --
--- The publication is created here so Debezium can subscribe immediately
--- without needing superuser CREATE PUBLICATION rights at runtime.
--- Tables are added to the publication by service migrations (Part 5-9)
--- using: ALTER PUBLICATION ledger_outbox_pub ADD TABLE <schema>.outbox_messages;
+-- No publication is created here, and no replication slot is pre-created.
 --
--- publication.autocreate.mode=filtered in the Debezium connector config
--- means Debezium will manage the publication if it does not exist.
--- This file ensures it exists before any service runs.
+-- Why this file no longer creates anything
+-- ----------------------------------------
+-- It previously ran:
+--
+--     SELECT pg_create_logical_replication_slot('ledger_outbox_slot', 'pgoutput') ...
+--     CREATE PUBLICATION ledger_outbox_pub FOR ALL TABLES;
+--
+-- Three problems:
+--
+-- 1. FOR ALL TABLES published every table in the database into the replication
+--    stream, including account.accounts and payout.payouts — the latter holding
+--    beneficiary bank account numbers and IBANs in its destination JSONB. A
+--    connector's table.include.list filters what it *consumes*; the publication
+--    still streams everything into the slot. Personal financial data should not
+--    be in a replication stream nothing needs.
+--
+-- 2. This file's own comments claimed each service migration would run
+--    "ALTER PUBLICATION ledger_outbox_pub ADD TABLE <schema>.outbox_messages".
+--    No migration ever did. FOR ALL TABLES made it work by accident, which is
+--    why the discrepancy went unnoticed.
+--
+-- 3. It conflicted with the Debezium connector's publication.autocreate.mode,
+--    producing the "publication already active" failure that procedure.md
+--    documented a manual workaround for.
+--
+-- The outbox connector has since been removed entirely: event publication is
+-- owned by the Go relay in services/consumers, which polls the outbox tables
+-- directly and needs no logical replication. See infra/debezium/README.md.
+--
+-- An unused replication slot is not harmless either: Postgres retains WAL
+-- indefinitely for an inactive slot, so a slot nothing reads eventually fills
+-- the disk.
+--
+-- If you add a CDC consumer
+-- -------------------------
+-- Create a publication naming only the tables it needs, never FOR ALL TABLES:
+--
+--     CREATE PUBLICATION my_feature_pub FOR TABLE some_schema.some_table;
+--
+-- and let the connector manage its own slot, so the slot's lifetime matches the
+-- consumer's.
 
-SELECT pg_create_logical_replication_slot('ledger_outbox_slot', 'pgoutput')
-WHERE NOT EXISTS (
-    SELECT 1 FROM pg_replication_slots WHERE slot_name = 'ledger_outbox_slot'
-);
-
--- The publication starts empty. Each service migration adds its outbox
--- table with: ALTER PUBLICATION ledger_outbox_pub ADD TABLE ...
-CREATE PUBLICATION ledger_outbox_pub FOR ALL TABLES;
+-- Confirm logical decoding is enabled, so a misconfigured server surfaces the
+-- problem at init rather than when a connector is first registered.
+DO $$
+BEGIN
+    IF current_setting('wal_level') <> 'logical' THEN
+        RAISE WARNING 'wal_level is %, not logical — logical replication is unavailable',
+            current_setting('wal_level');
+    END IF;
+END
+$$;

@@ -1,88 +1,111 @@
 package handler
 
 import (
-	"encoding/json"
 	"net/http"
 
 	accountv1 "github.com/prasham/ledger/gen/account/v1"
 	commonv1 "github.com/prasham/ledger/gen/common/v1"
 )
 
-func (h *Handler) listAccounts(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) listAccounts(w http.ResponseWriter, r *http.Request, _ Identity) {
 	ownerID := r.URL.Query().Get("owner_id")
 	if ownerID == "" {
 		writeError(w, http.StatusBadRequest, "owner_id required")
 		return
 	}
-	resp, err := h.account.ListAccounts(r.Context(), &accountv1.ListAccountsRequest{
-		OwnerId:  ownerID,
-		PageSize: 50,
+
+	resp, err := h.clients.Account.ListAccounts(r.Context(), &accountv1.ListAccountsRequest{
+		OwnerId:   ownerID,
+		PageSize:  50,
+		PageToken: r.URL.Query().Get("page_token"),
 	})
 	if err != nil {
-		writeError(w, grpcStatus(err), err.Error())
+		h.writeGRPCError(w, r, err)
 		return
 	}
 	writeProto(w, http.StatusOK, resp)
 }
 
-func (h *Handler) createAccount(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) createAccount(w http.ResponseWriter, r *http.Request, id Identity) {
 	var body struct {
 		IdempotencyKey string `json:"idempotency_key"`
 		OwnerID        string `json:"owner_id"`
 		Currency       string `json:"currency"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON")
+	if !decodeJSON(w, r, &body) {
 		return
 	}
-	resp, err := h.account.CreateAccount(r.Context(), &accountv1.CreateAccountRequest{
+
+	resp, err := h.clients.Account.CreateAccount(r.Context(), &accountv1.CreateAccountRequest{
 		IdempotencyKey: body.IdempotencyKey,
 		OwnerId:        body.OwnerID,
 		Currency:       body.Currency,
 	})
 	if err != nil {
-		writeError(w, grpcStatus(err), err.Error())
+		h.writeGRPCError(w, r, err)
 		return
 	}
+
+	h.log.Info().
+		Str("actor", id.Subject).
+		Str("owner_id", body.OwnerID).
+		Str("currency", body.Currency).
+		Msg("account created")
 	writeProto(w, http.StatusCreated, resp)
 }
 
-func (h *Handler) getAccount(w http.ResponseWriter, r *http.Request) {
-	resp, err := h.account.GetAccount(r.Context(), &accountv1.GetAccountRequest{
+func (h *Handler) getAccount(w http.ResponseWriter, r *http.Request, _ Identity) {
+	resp, err := h.clients.Account.GetAccount(r.Context(), &accountv1.GetAccountRequest{
 		AccountId: r.PathValue("id"),
 	})
 	if err != nil {
-		writeError(w, grpcStatus(err), err.Error())
+		h.writeGRPCError(w, r, err)
 		return
 	}
 	writeProto(w, http.StatusOK, resp)
 }
 
-func (h *Handler) creditAccount(w http.ResponseWriter, r *http.Request) {
+// creditAccount adds funds outside the payment saga.
+//
+// This creates money, so it is admin-only and every call is logged with the
+// acting subject. The route previously required no authentication at all.
+func (h *Handler) creditAccount(w http.ResponseWriter, r *http.Request, id Identity) {
 	var body struct {
 		IdempotencyKey string `json:"idempotency_key"`
 		Amount         string `json:"amount"`
 		Currency       string `json:"currency"`
 		ReferenceID    string `json:"reference_id"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON")
+	if !decodeJSON(w, r, &body) {
 		return
 	}
-	resp, err := h.account.CreditAccount(r.Context(), &accountv1.CreditAccountRequest{
+
+	accountID := r.PathValue("id")
+	resp, err := h.clients.Account.CreditAccount(r.Context(), &accountv1.CreditAccountRequest{
 		IdempotencyKey: body.IdempotencyKey,
-		AccountId:      r.PathValue("id"),
+		AccountId:      accountID,
 		Amount:         &commonv1.Money{Amount: body.Amount, Currency: body.Currency},
 		ReferenceId:    body.ReferenceID,
 	})
 	if err != nil {
-		writeError(w, grpcStatus(err), err.Error())
+		h.writeGRPCError(w, r, err)
 		return
 	}
+
+	// Direct balance adjustments are the most privileged operation available, so
+	// they always leave an audit line naming who performed them.
+	h.log.Warn().
+		Str("actor", id.Subject).
+		Str("account_id", accountID).
+		Str("amount", body.Amount).
+		Str("currency", body.Currency).
+		Str("reference_id", body.ReferenceID).
+		Msg("account credited directly (outside the payment saga)")
 	writeProto(w, http.StatusOK, resp)
 }
 
-func (h *Handler) debitAccount(w http.ResponseWriter, r *http.Request) {
+// debitAccount removes funds outside the payment saga. Admin-only, and logged.
+func (h *Handler) debitAccount(w http.ResponseWriter, r *http.Request, id Identity) {
 	var body struct {
 		IdempotencyKey string `json:"idempotency_key"`
 		Amount         string `json:"amount"`
@@ -90,25 +113,34 @@ func (h *Handler) debitAccount(w http.ResponseWriter, r *http.Request) {
 		HoldID         string `json:"hold_id"`
 		ReferenceID    string `json:"reference_id"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON")
+	if !decodeJSON(w, r, &body) {
 		return
 	}
-	resp, err := h.account.DebitAccount(r.Context(), &accountv1.DebitAccountRequest{
+
+	accountID := r.PathValue("id")
+	resp, err := h.clients.Account.DebitAccount(r.Context(), &accountv1.DebitAccountRequest{
 		IdempotencyKey: body.IdempotencyKey,
-		AccountId:      r.PathValue("id"),
+		AccountId:      accountID,
 		Amount:         &commonv1.Money{Amount: body.Amount, Currency: body.Currency},
 		HoldId:         body.HoldID,
 		ReferenceId:    body.ReferenceID,
 	})
 	if err != nil {
-		writeError(w, grpcStatus(err), err.Error())
+		h.writeGRPCError(w, r, err)
 		return
 	}
+
+	h.log.Warn().
+		Str("actor", id.Subject).
+		Str("account_id", accountID).
+		Str("amount", body.Amount).
+		Str("currency", body.Currency).
+		Str("reference_id", body.ReferenceID).
+		Msg("account debited directly (outside the payment saga)")
 	writeProto(w, http.StatusOK, resp)
 }
 
-func (h *Handler) placeHold(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) placeHold(w http.ResponseWriter, r *http.Request, id Identity) {
 	var body struct {
 		IdempotencyKey string `json:"idempotency_key"`
 		Amount         string `json:"amount"`
@@ -116,36 +148,49 @@ func (h *Handler) placeHold(w http.ResponseWriter, r *http.Request) {
 		ReferenceID    string `json:"reference_id"`
 		TTLSeconds     int64  `json:"ttl_seconds"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON")
+	if !decodeJSON(w, r, &body) {
 		return
 	}
-	ttl := body.TTLSeconds
-	if ttl <= 0 {
-		ttl = 172800
-	}
-	resp, err := h.account.PlaceHold(r.Context(), &accountv1.PlaceHoldRequest{
+
+	accountID := r.PathValue("id")
+	// TTL bounds are enforced by account-svc, which is the authority; passing the
+	// value through unchanged keeps a single place to change the policy.
+	resp, err := h.clients.Account.PlaceHold(r.Context(), &accountv1.PlaceHoldRequest{
 		IdempotencyKey: body.IdempotencyKey,
-		AccountId:      r.PathValue("id"),
+		AccountId:      accountID,
 		Amount:         &commonv1.Money{Amount: body.Amount, Currency: body.Currency},
 		ReferenceId:    body.ReferenceID,
-		TtlSeconds:     ttl,
+		TtlSeconds:     body.TTLSeconds,
 	})
 	if err != nil {
-		writeError(w, grpcStatus(err), err.Error())
+		h.writeGRPCError(w, r, err)
 		return
 	}
+
+	h.log.Info().
+		Str("actor", id.Subject).
+		Str("account_id", accountID).
+		Str("reference_id", body.ReferenceID).
+		Msg("hold placed")
 	writeProto(w, http.StatusCreated, resp)
 }
 
-func (h *Handler) releaseHold(w http.ResponseWriter, r *http.Request) {
-	_, err := h.account.ReleaseHold(r.Context(), &accountv1.ReleaseHoldRequest{
-		AccountId: r.PathValue("id"),
-		HoldId:    r.PathValue("hold_id"),
-	})
-	if err != nil {
-		writeError(w, grpcStatus(err), err.Error())
+func (h *Handler) releaseHold(w http.ResponseWriter, r *http.Request, id Identity) {
+	accountID := r.PathValue("id")
+	holdID := r.PathValue("hold_id")
+
+	if _, err := h.clients.Account.ReleaseHold(r.Context(), &accountv1.ReleaseHoldRequest{
+		AccountId: accountID,
+		HoldId:    holdID,
+	}); err != nil {
+		h.writeGRPCError(w, r, err)
 		return
 	}
+
+	h.log.Info().
+		Str("actor", id.Subject).
+		Str("account_id", accountID).
+		Str("hold_id", holdID).
+		Msg("hold released")
 	w.WriteHeader(http.StatusNoContent)
 }
